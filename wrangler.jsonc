@@ -1,0 +1,11 @@
+{
+	"name": "x92-layout-api",
+	"main": "index.js",
+	"compatibility_date": "2026-09-01",
+	"kv_namespaces": [
+		{
+			"binding": "LAYOUT_KV",
+			"id": "1b46f58e363446428fe90effbaad0048"
+		}
+	]
+}

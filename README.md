@@ -41,62 +41,39 @@ Earlier iterations let the `admin` entry's trigger word and enabled flag be edit
 - [Node.js](https://nodejs.org) (any recent LTS)
 - A Cloudflare account (free tier is fine)
 
-This repo currently holds just the Worker's script, `index.js` — there's no `package.json` or `wrangler.jsonc` checked in. To deploy your own instance, scaffold a Wrangler project around it:
-
 ## Setup
 
 1. **Clone this repo** and open a terminal inside it.
 
-2. **Add a minimal Wrangler project** alongside `index.js`:
-   - `package.json`:
-     ```json
-     {
-       "name": "oliverbar-net-api",
-       "private": true,
-       "devDependencies": { "wrangler": "^4.0.0" }
-     }
-     ```
-   - `wrangler.jsonc`:
-     ```jsonc
-     {
-       "name": "oliverbar-net-api",
-       "main": "index.js",
-       "compatibility_date": "2026-09-01",
-       "kv_namespaces": [
-         { "binding": "LAYOUT_KV", "id": "PASTE_YOUR_KV_NAMESPACE_ID_HERE" }
-       ]
-     }
-     ```
-
-3. **Install dependencies** (this installs Wrangler, Cloudflare's CLI):
+2. **Install dependencies** (this installs Wrangler, Cloudflare's CLI):
    ```
    npm install
    ```
 
-4. **Log in to Cloudflare:**
+3. **Log in to Cloudflare:**
    ```
    npx wrangler login
    ```
 
-5. **Create the KV namespace:**
+4. **Create your own KV namespace** (only needed if you're standing up a separate instance rather than deploying to the existing `x92-layout-api` Worker this repo is already wired to):
    ```
    npx wrangler kv namespace create LAYOUT_KV
    ```
-   This prints an `id` — paste it into `wrangler.jsonc` in place of `PASTE_YOUR_KV_NAMESPACE_ID_HERE`.
+   This prints an `id` — paste it into `wrangler.jsonc` in place of the existing one.
 
-6. **Set the edit password as a secret** (kept out of source, unlike the front-end's client-side password check):
+5. **Set the edit password as a secret** (kept out of source, unlike the front-end's client-side password check):
    ```
    npx wrangler secret put EDIT_PASSWORD
    ```
    Use the same password the site's editor/admin pages expect — see [oliverbar.net](https://github.com/skhshths/oliverbar.net).
 
-7. **Deploy:**
+6. **Deploy:**
    ```
    npx wrangler deploy
    ```
-   Wrangler prints your Worker's `*.workers.dev` URL. If you're pointing custom domains at it (like `api.oliverbar.net` / `pages.oliverbar.net` here), add those under **Cloudflare dashboard → Worker → Settings → Domains & Routes → Add → Custom Domain**.
+   Wrangler prints your Worker's `*.workers.dev` URL. If you're pointing custom domains at it (like `api.oliverbar.net` / `pages.oliverbar.net` here), add those under **Cloudflare dashboard → Worker → Settings → Domains & Routes → Add → Custom Domain**. This also runs automatically on every push to `main` if the repo is connected via Cloudflare's Git integration (Workers Builds).
 
-8. **Wire it up to the site** — paste the Worker's URL (or custom domain) into the `API_BASE` constant near the top of every page in the site repo that has one: `index.html`, the admin page, the interactive page, and the chat page. Re-upload to Cloudflare Pages.
+7. **Wire it up to the site** — paste the Worker's URL (or custom domain) into the `API_BASE` constant near the top of every page in the site repo that has one: `index.html`, the admin page, the interactive page, and the chat page. Re-upload to Cloudflare Pages.
 
 ## About the "custom pages" feature
 
