@@ -1,0 +1,9 @@
+# Wrangler / Cloudflare Workers
+node_modules/
+.wrangler/
+.dev.vars
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp

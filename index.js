@@ -1,4 +1,5 @@
 const ADMIN_TRIGGER_FIXED = "ADMIN"; // permanently fixed, cannot be changed via the admin UI or the API
+const ROOT_SITE = "https://oliverbar.net/"; // where /page/<slug> bounces to when there's no valid access token
 
 const DEFAULT_CONFIG = {
   admin:       { label: "Admin",       trigger: ADMIN_TRIGGER_FIXED, enabled: true },
@@ -11,6 +12,44 @@ const DEFAULT_CONFIG = {
 const MAX_CHAT_MESSAGES = 200;
 const MAX_NAME_LENGTH = 24;
 const MAX_MESSAGE_LENGTH = 500;
+const MIN_PIN_LENGTH = 3;
+const MAX_PIN_LENGTH = 32;
+const PBKDF2_ITERATIONS = 100000;
+
+const PAGE_TOKEN_TTL_SECONDS = 60; // how long a minted /page/ access token stays valid if unused
+const PRESENCE_TTL_SECONDS = 30; // a presence ping counts as "here" for this long
+
+function randomHex(byteLength) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
+
+function hexToBytes(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  }
+  return bytes;
+}
+
+// PIN hashing for the chat "claim a name" system — PBKDF2 with a random
+// per-name salt, via the Workers runtime's built-in Web Crypto support.
+// Nothing here is stronger than the rest of this project's "casual, not
+// bank-grade" security model, but it does mean the PIN itself is never
+// stored or logged in the clear.
+async function hashPin(pin, saltHex) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", enc.encode(pin), { name: "PBKDF2" }, false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt: hexToBytes(saltHex), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
+    keyMaterial,
+    256
+  );
+  return Array.from(new Uint8Array(bits)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
+}
 
 export default {
   async fetch(request, env) {
@@ -145,9 +184,12 @@ export default {
     }
 
     // ---------- Global chat ----------
-    // No password on this one by design — it's meant to be open to
-    // anyone who reaches the chat page. See the README for the real
-    // implications of that (no rate limiting, no moderation).
+    // Posting still needs no admin password — anyone who reaches the
+    // chat page can send messages. What changed: a display name is now
+    // "claimed" by whoever first posts under it, with a short PIN. From
+    // then on, posting as that name again requires the same PIN, so
+    // nobody else can send messages under it. See the README for what
+    // this does and doesn't protect against.
     if (url.pathname === "/api/chat" && request.method === "GET") {
       const stored = await env.LAYOUT_KV.get("chat_messages");
       return new Response(stored || "[]", {
@@ -167,26 +209,121 @@ export default {
         });
       }
 
-      const name = typeof parsed.name === "string" ? parsed.name.trim().slice(0, MAX_NAME_LENGTH) : "";
+      const rawName = typeof parsed.name === "string" ? parsed.name.trim().slice(0, MAX_NAME_LENGTH) : "";
+      const pin = typeof parsed.pin === "string" ? parsed.pin : "";
       const text = typeof parsed.text === "string" ? parsed.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
 
-      if (!name || !text) {
+      if (!rawName || !text) {
         return new Response(JSON.stringify({ error: "name and text are required" }), {
           status: 400,
           headers: { "Content-Type": "application/json", ...corsHeaders },
         });
+      }
+      if (pin.length < MIN_PIN_LENGTH || pin.length > MAX_PIN_LENGTH) {
+        return new Response(JSON.stringify({ error: "PIN must be " + MIN_PIN_LENGTH + "-" + MAX_PIN_LENGTH + " characters" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const namesStored = await env.LAYOUT_KV.get("chat_names");
+      let names = {};
+      try { names = namesStored ? JSON.parse(namesStored) : {}; } catch (e) { names = {}; }
+
+      const key = rawName.toLowerCase();
+      let displayName = rawName;
+
+      if (names[key]) {
+        // Name already claimed — the PIN has to match, or this is
+        // someone trying to post as another person.
+        const candidateHash = await hashPin(pin, names[key].saltHex);
+        if (candidateHash !== names[key].hashHex) {
+          return new Response(JSON.stringify({ error: "That name is already claimed — wrong PIN." }), {
+            status: 401,
+            headers: { "Content-Type": "application/json", ...corsHeaders },
+          });
+        }
+        // Always render with the casing the name was first claimed
+        // with, so "Bob" and "bob" can't be used to impersonate.
+        displayName = names[key].name;
+      } else {
+        // First time this name has been used — claim it with this PIN.
+        const saltHex = randomHex(16);
+        const hashHex = await hashPin(pin, saltHex);
+        names[key] = { name: rawName, saltHex: saltHex, hashHex: hashHex, createdAt: Date.now() };
+        await env.LAYOUT_KV.put("chat_names", JSON.stringify(names));
       }
 
       const stored = await env.LAYOUT_KV.get("chat_messages");
       let messages = [];
       try { messages = stored ? JSON.parse(stored) : []; } catch (e) { messages = []; }
 
-      messages.push({ name: name, text: text, ts: Date.now() });
+      messages.push({ name: displayName, text: text, ts: Date.now() });
       if (messages.length > MAX_CHAT_MESSAGES) {
         messages = messages.slice(messages.length - MAX_CHAT_MESSAGES);
       }
 
       await env.LAYOUT_KV.put("chat_messages", JSON.stringify(messages));
+      return new Response(JSON.stringify({ ok: true, name: displayName }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // ---------- Chat accounts (claimed names) — admin-only view ----------
+    if (url.pathname === "/api/chat/names" && request.method === "GET") {
+      const editKey = request.headers.get("X-Edit-Key") || "";
+      if (editKey !== env.EDIT_PASSWORD) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const namesStored = await env.LAYOUT_KV.get("chat_names");
+      let names = {};
+      try { names = namesStored ? JSON.parse(namesStored) : {}; } catch (e) { names = {}; }
+
+      const list = Object.keys(names).map(function (key) {
+        return { name: names[key].name, createdAt: names[key].createdAt };
+      }).sort(function (a, b) { return a.createdAt - b.createdAt; });
+
+      return new Response(JSON.stringify(list), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // Frees up a claimed name (e.g. someone claimed it maliciously, or
+    // the real owner lost their PIN). Next message sent under that name
+    // claims it fresh with a new PIN.
+    if (url.pathname === "/api/chat/names/release" && request.method === "POST") {
+      const editKey = request.headers.get("X-Edit-Key") || "";
+      if (editKey !== env.EDIT_PASSWORD) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const name = typeof parsed.name === "string" ? parsed.name : "";
+      if (!name) {
+        return new Response(JSON.stringify({ error: "name is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const namesStored = await env.LAYOUT_KV.get("chat_names");
+      let names = {};
+      try { names = namesStored ? JSON.parse(namesStored) : {}; } catch (e) { names = {}; }
+      delete names[name.toLowerCase()];
+      await env.LAYOUT_KV.put("chat_names", JSON.stringify(names));
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
@@ -249,6 +386,42 @@ export default {
       });
     }
 
+    // Mints a short-lived, single-use token needed to view a custom page
+    // at /page/<slug>. Without one, that URL just bounces to the home
+    // page — see the /page/ route below. This is what makes those pages
+    // unreachable by bookmark/reload, the same way the built-in hidden
+    // pages already are via sessionStorage (which can't be used here
+    // since pages.oliverbar.net is a different origin than oliverbar.net).
+    if (url.pathname === "/api/pages/token" && request.method === "POST") {
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const slug = typeof parsed.slug === "string" ? parsed.slug : "";
+      if (!slug) {
+        return new Response(JSON.stringify({ error: "slug is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const token = crypto.randomUUID();
+      await env.LAYOUT_KV.put("page_token:" + token, JSON.stringify({ slug: slug }), {
+        expirationTtl: PAGE_TOKEN_TTL_SECONDS,
+      });
+
+      return new Response(JSON.stringify({ token: token }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
     // ---------- Clear chat (admin-only) ----------
     if (url.pathname === "/api/chat/clear" && request.method === "POST") {
       const editKey = request.headers.get("X-Edit-Key") || "";
@@ -264,9 +437,126 @@ export default {
       });
     }
 
-    // Serving a stored custom page directly, e.g. GET /page/my-slug
+    // ---------- Experimental: trigger usage stats ----------
+    // Fired (fire-and-forget, no auth) by index.html every time a
+    // trigger word successfully matches. Purely a curiosity metric for
+    // the admin panel's Experimental tab — nothing reads these back
+    // except that page.
+    if (url.pathname === "/api/stats/trigger" && request.method === "POST") {
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const slug = typeof parsed.slug === "string" ? parsed.slug.slice(0, 64) : "";
+      if (!slug) {
+        return new Response(JSON.stringify({ error: "slug is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const statsStored = await env.LAYOUT_KV.get("trigger_stats");
+      let stats = {};
+      try { stats = statsStored ? JSON.parse(statsStored) : {}; } catch (e) { stats = {}; }
+      stats[slug] = (stats[slug] || 0) + 1;
+      await env.LAYOUT_KV.put("trigger_stats", JSON.stringify(stats));
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    if (url.pathname === "/api/stats/trigger" && request.method === "GET") {
+      const editKey = request.headers.get("X-Edit-Key") || "";
+      if (editKey !== env.EDIT_PASSWORD) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const statsStored = await env.LAYOUT_KV.get("trigger_stats");
+      return new Response(statsStored || "{}", {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // ---------- Experimental: live presence ----------
+    // index.html pings this quietly in the background while the black
+    // screen is open. Each ping is a short-lived KV key, so the count
+    // below is "how many tabs pinged in the last 30 seconds" — a rough,
+    // fun number, not a precise analytics feature.
+    if (url.pathname === "/api/presence/ping" && request.method === "POST") {
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const id = typeof parsed.id === "string" ? parsed.id.slice(0, 64) : "";
+      if (!id) {
+        return new Response(JSON.stringify({ error: "id is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      await env.LAYOUT_KV.put("presence:" + id, "1", { expirationTtl: PRESENCE_TTL_SECONDS });
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    if (url.pathname === "/api/presence/count" && request.method === "GET") {
+      const editKey = request.headers.get("X-Edit-Key") || "";
+      if (editKey !== env.EDIT_PASSWORD) {
+        return new Response(JSON.stringify({ error: "Unauthorized" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const listed = await env.LAYOUT_KV.list({ prefix: "presence:", limit: 1000 });
+      return new Response(JSON.stringify({ count: listed.keys.length }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // Serving a stored custom page directly, e.g. GET /page/my-slug —
+    // requires a valid, single-use token minted via /api/pages/token
+    // (see above). No token, an expired one, or one minted for a
+    // different slug all bounce to the home page instead of the page
+    // content, and the token is consumed either way so a reload always
+    // bounces too.
     if (url.pathname.startsWith("/page/") && request.method === "GET") {
       const slug = url.pathname.slice("/page/".length);
+      const token = url.searchParams.get("t") || "";
+
+      if (!token) {
+        return Response.redirect(ROOT_SITE, 302);
+      }
+
+      const tokenRecord = await env.LAYOUT_KV.get("page_token:" + token);
+      // Single-use regardless of outcome — a second request with the
+      // same token (e.g. a reload) must never succeed.
+      if (tokenRecord) {
+        await env.LAYOUT_KV.delete("page_token:" + token);
+      }
+      if (!tokenRecord) {
+        return Response.redirect(ROOT_SITE, 302);
+      }
+
+      let tokenData;
+      try { tokenData = JSON.parse(tokenRecord); } catch (e) { tokenData = null; }
+      if (!tokenData || tokenData.slug !== slug) {
+        return Response.redirect(ROOT_SITE, 302);
+      }
+
       const stored = await env.LAYOUT_KV.get("custom_pages");
       let pages = [];
       try { pages = stored ? JSON.parse(stored) : []; } catch (e) { pages = []; }
@@ -275,7 +565,11 @@ export default {
         return new Response("Not found", { status: 404, headers: corsHeaders });
       }
       return new Response(page.html, {
-        headers: { "Content-Type": "text/html; charset=utf-8", ...corsHeaders },
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "no-store",
+          ...corsHeaders,
+        },
       });
     }
 
