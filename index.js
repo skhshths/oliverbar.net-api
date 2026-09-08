@@ -10,6 +10,7 @@ const DEFAULT_CONFIG = {
 };
 
 const MAX_CHAT_MESSAGES = 200;
+const MAX_DM_MESSAGES = 300;
 const MAX_NAME_LENGTH = 24;
 const MAX_MESSAGE_LENGTH = 500;
 const MIN_PIN_LENGTH = 3;
@@ -18,6 +19,7 @@ const PBKDF2_ITERATIONS = 100000;
 
 const PAGE_TOKEN_TTL_SECONDS = 60; // how long a minted /page/ access token stays valid if unused
 const PRESENCE_TTL_SECONDS = 30; // a presence ping counts as "here" for this long
+const CHAT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // how long a chat login stays valid
 
 function randomHex(byteLength) {
   const bytes = new Uint8Array(byteLength);
@@ -51,6 +53,72 @@ async function hashPin(pin, saltHex) {
   return Array.from(new Uint8Array(bits)).map(function (b) { return b.toString(16).padStart(2, "0"); }).join("");
 }
 
+// Looks up (or claims) a name against the in-memory `names` map — the
+// caller is responsible for loading it from KV first and saving it back
+// afterward. Mutates `names` in place when claiming a brand-new name.
+async function claimOrVerifyName(names, rawName, pin) {
+  const key = rawName.toLowerCase();
+  if (names[key]) {
+    const candidateHash = await hashPin(pin, names[key].saltHex);
+    if (candidateHash !== names[key].hashHex) {
+      return { ok: false, error: "That name is already claimed — wrong PIN." };
+    }
+    // Always the casing the name was first claimed with, so "Bob" and
+    // "bob" can't be used to blur who's who.
+    return { ok: true, name: names[key].name };
+  }
+  const saltHex = randomHex(16);
+  const hashHex = await hashPin(pin, saltHex);
+  names[key] = { name: rawName, saltHex: saltHex, hashHex: hashHex, createdAt: Date.now() };
+  return { ok: true, name: rawName };
+}
+
+// Resolves the logged-in chat display name from the X-Chat-Session
+// header, minted by /api/chat/login. Used to gate posting to global
+// chat and everything DM-related — reading global chat stays public.
+async function getSessionName(request, env) {
+  const token = request.headers.get("X-Chat-Session") || "";
+  if (!token) return null;
+  const stored = await env.LAYOUT_KV.get("chat_session:" + token);
+  if (!stored) return null;
+  try {
+    const data = JSON.parse(stored);
+    return data && typeof data.name === "string" ? data.name : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// A DM conversation is identified by both participants' names, sorted
+// case-insensitively, so it doesn't matter who started it or who's
+// asking — "A and B" is always the same key.
+function dmPairKey(a, b) {
+  const sorted = [a.toLowerCase(), b.toLowerCase()].sort();
+  return sorted[0] + "::" + sorted[1];
+}
+
+// Updates `ownerName`'s DM thread list with the latest message to/from
+// `partnerName`, so their inbox shows a live preview without having to
+// fetch every conversation's full history.
+async function upsertThread(env, ownerName, partnerName, message) {
+  const key = "dm_threads:" + ownerName.toLowerCase();
+  const stored = await env.LAYOUT_KV.get(key);
+  let threads = [];
+  try { threads = stored ? JSON.parse(stored) : []; } catch (e) { threads = []; }
+
+  const partnerKey = partnerName.toLowerCase();
+  const existing = threads.find(function (t) { return t.partner.toLowerCase() === partnerKey; });
+  if (existing) {
+    existing.lastTs = message.ts;
+    existing.lastText = message.text;
+    existing.lastFrom = message.from;
+  } else {
+    threads.push({ partner: partnerName, lastTs: message.ts, lastText: message.text, lastFrom: message.from });
+  }
+
+  await env.LAYOUT_KV.put(key, JSON.stringify(threads));
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -58,7 +126,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Edit-Key",
+      "Access-Control-Allow-Headers": "Content-Type, X-Edit-Key, X-Chat-Session",
     };
 
     if (request.method === "OPTIONS") {
@@ -183,21 +251,13 @@ export default {
       });
     }
 
-    // ---------- Global chat ----------
-    // Posting still needs no admin password — anyone who reaches the
-    // chat page can send messages. What changed: a display name is now
-    // "claimed" by whoever first posts under it, with a short PIN. From
-    // then on, posting as that name again requires the same PIN, so
-    // nobody else can send messages under it. See the README for what
-    // this does and doesn't protect against.
-    if (url.pathname === "/api/chat" && request.method === "GET") {
-      const stored = await env.LAYOUT_KV.get("chat_messages");
-      return new Response(stored || "[]", {
-        headers: { "Content-Type": "application/json", ...corsHeaders },
-      });
-    }
-
-    if (url.pathname === "/api/chat" && request.method === "POST") {
+    // ---------- Chat login (claims a name on first use) ----------
+    // The one place a name+PIN pair is ever checked. A successful login
+    // mints a session token good for a week, which is what every other
+    // chat/DM route below expects in the X-Chat-Session header — so a
+    // login persisted client-side (e.g. localStorage) is what gives
+    // "log back in and see your history" behavior.
+    if (url.pathname === "/api/chat/login" && request.method === "POST") {
       let body, parsed;
       try {
         body = await request.text();
@@ -211,10 +271,9 @@ export default {
 
       const rawName = typeof parsed.name === "string" ? parsed.name.trim().slice(0, MAX_NAME_LENGTH) : "";
       const pin = typeof parsed.pin === "string" ? parsed.pin : "";
-      const text = typeof parsed.text === "string" ? parsed.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
 
-      if (!rawName || !text) {
-        return new Response(JSON.stringify({ error: "name and text are required" }), {
+      if (!rawName) {
+        return new Response(JSON.stringify({ error: "name is required" }), {
           status: 400,
           headers: { "Content-Type": "application/json", ...corsHeaders },
         });
@@ -230,41 +289,199 @@ export default {
       let names = {};
       try { names = namesStored ? JSON.parse(namesStored) : {}; } catch (e) { names = {}; }
 
-      const key = rawName.toLowerCase();
-      let displayName = rawName;
+      const result = await claimOrVerifyName(names, rawName, pin);
+      if (!result.ok) {
+        return new Response(JSON.stringify({ error: result.error }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      await env.LAYOUT_KV.put("chat_names", JSON.stringify(names));
 
-      if (names[key]) {
-        // Name already claimed — the PIN has to match, or this is
-        // someone trying to post as another person.
-        const candidateHash = await hashPin(pin, names[key].saltHex);
-        if (candidateHash !== names[key].hashHex) {
-          return new Response(JSON.stringify({ error: "That name is already claimed — wrong PIN." }), {
-            status: 401,
-            headers: { "Content-Type": "application/json", ...corsHeaders },
-          });
-        }
-        // Always render with the casing the name was first claimed
-        // with, so "Bob" and "bob" can't be used to impersonate.
-        displayName = names[key].name;
-      } else {
-        // First time this name has been used — claim it with this PIN.
-        const saltHex = randomHex(16);
-        const hashHex = await hashPin(pin, saltHex);
-        names[key] = { name: rawName, saltHex: saltHex, hashHex: hashHex, createdAt: Date.now() };
-        await env.LAYOUT_KV.put("chat_names", JSON.stringify(names));
+      const token = crypto.randomUUID();
+      await env.LAYOUT_KV.put("chat_session:" + token, JSON.stringify({ name: result.name }), {
+        expirationTtl: CHAT_SESSION_TTL_SECONDS,
+      });
+
+      return new Response(JSON.stringify({ token: token, name: result.name }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // Lets the site quietly check whether a session token it already
+    // has (e.g. saved in localStorage from a previous visit) is still
+    // good, without re-prompting for a PIN.
+    if (url.pathname === "/api/chat/session" && request.method === "GET") {
+      const name = await getSessionName(request, env);
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Not logged in" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      return new Response(JSON.stringify({ name: name }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // ---------- Global chat ----------
+    // Reading is public. Posting requires a logged-in session (see
+    // /api/chat/login above) — the display name comes from the
+    // session, never from the request body, so nobody can post under a
+    // name they haven't proven they own.
+    if (url.pathname === "/api/chat" && request.method === "GET") {
+      const stored = await env.LAYOUT_KV.get("chat_messages");
+      return new Response(stored || "[]", {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    if (url.pathname === "/api/chat" && request.method === "POST") {
+      const name = await getSessionName(request, env);
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Not logged in" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const text = typeof parsed.text === "string" ? parsed.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
+      if (!text) {
+        return new Response(JSON.stringify({ error: "text is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
       }
 
       const stored = await env.LAYOUT_KV.get("chat_messages");
       let messages = [];
       try { messages = stored ? JSON.parse(stored) : []; } catch (e) { messages = []; }
 
-      messages.push({ name: displayName, text: text, ts: Date.now() });
+      messages.push({ name: name, text: text, ts: Date.now() });
       if (messages.length > MAX_CHAT_MESSAGES) {
         messages = messages.slice(messages.length - MAX_CHAT_MESSAGES);
       }
 
       await env.LAYOUT_KV.put("chat_messages", JSON.stringify(messages));
-      return new Response(JSON.stringify({ ok: true, name: displayName }), {
+      return new Response(JSON.stringify({ ok: true, name: name }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // ---------- Direct messages ----------
+    // Session-authenticated, same as posting to global chat. Unlike
+    // global chat, reading is gated too — only the two participants in
+    // a conversation can see it.
+    if (url.pathname === "/api/dm/send" && request.method === "POST") {
+      const fromName = await getSessionName(request, env);
+      if (!fromName) {
+        return new Response(JSON.stringify({ error: "Not logged in" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      let body, parsed;
+      try {
+        body = await request.text();
+        parsed = JSON.parse(body);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "Invalid JSON" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const toName = typeof parsed.to === "string" ? parsed.to.trim().slice(0, MAX_NAME_LENGTH) : "";
+      const text = typeof parsed.text === "string" ? parsed.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
+
+      if (!toName || !text) {
+        return new Response(JSON.stringify({ error: "to and text are required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      if (toName.toLowerCase() === fromName.toLowerCase()) {
+        return new Response(JSON.stringify({ error: "Can't DM yourself" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+
+      const pairKey = dmPairKey(fromName, toName);
+      const stored = await env.LAYOUT_KV.get("dm_messages:" + pairKey);
+      let messages = [];
+      try { messages = stored ? JSON.parse(stored) : []; } catch (e) { messages = []; }
+
+      const message = { from: fromName, text: text, ts: Date.now() };
+      messages.push(message);
+      if (messages.length > MAX_DM_MESSAGES) {
+        messages = messages.slice(messages.length - MAX_DM_MESSAGES);
+      }
+      await env.LAYOUT_KV.put("dm_messages:" + pairKey, JSON.stringify(messages));
+
+      // Update both participants' inboxes so each sees this
+      // conversation with a fresh preview — including the sender's own
+      // list, so their own outgoing message shows up immediately too.
+      await upsertThread(env, fromName, toName, message);
+      await upsertThread(env, toName, fromName, message);
+
+      return new Response(JSON.stringify({ ok: true }), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // Lists the logged-in user's DM conversations, most recent first —
+    // each with the other person's name and a preview of the last
+    // message, so the inbox can render without fetching every thread.
+    if (url.pathname === "/api/dm/threads" && request.method === "GET") {
+      const name = await getSessionName(request, env);
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Not logged in" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const stored = await env.LAYOUT_KV.get("dm_threads:" + name.toLowerCase());
+      let threads = [];
+      try { threads = stored ? JSON.parse(stored) : []; } catch (e) { threads = []; }
+      threads.sort(function (a, b) { return b.lastTs - a.lastTs; });
+      return new Response(JSON.stringify(threads), {
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      });
+    }
+
+    // Full message history with one specific person — this is the
+    // "log in and see your history, like iMessage" part.
+    if (url.pathname === "/api/dm/messages" && request.method === "GET") {
+      const name = await getSessionName(request, env);
+      if (!name) {
+        return new Response(JSON.stringify({ error: "Not logged in" }), {
+          status: 401,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const withName = url.searchParams.get("with") || "";
+      if (!withName) {
+        return new Response(JSON.stringify({ error: "with is required" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json", ...corsHeaders },
+        });
+      }
+      const pairKey = dmPairKey(name, withName);
+      const stored = await env.LAYOUT_KV.get("dm_messages:" + pairKey);
+      return new Response(stored || "[]", {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
     }
@@ -292,7 +509,7 @@ export default {
     }
 
     // Frees up a claimed name (e.g. someone claimed it maliciously, or
-    // the real owner lost their PIN). Next message sent under that name
+    // the real owner lost their PIN). Next login under that name
     // claims it fresh with a new PIN.
     if (url.pathname === "/api/chat/names/release" && request.method === "POST") {
       const editKey = request.headers.get("X-Edit-Key") || "";

@@ -14,6 +14,9 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `site_config` | The four built-in pages' trigger words / enabled state, plus custom redirects |
 | `chat_messages` | The global chat's message history (capped at 200) |
 | `chat_names` | Claimed chat display names — hashed+salted PIN per name, never the PIN itself |
+| `chat_session:<token>` | A logged-in chat identity, valid for 7 days — see below |
+| `dm_messages:<pairKey>` | One conversation's full message history (capped at 300), keyed by both participants' names, sorted |
+| `dm_threads:<lowerName>` | One person's DM inbox — their conversation partners with a preview of the latest message each |
 | `custom_pages` | Raw HTML pages authored from the admin panel, served back at `/page/<slug>` |
 | `page_token:<token>` | Short-lived (60s), single-use tokens minted right before navigating to a `/page/<slug>` — see below |
 | `trigger_stats` | Usage counts per trigger word, for the admin panel's Experimental tab |
@@ -27,11 +30,16 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/layout` | POST | `X-Edit-Key` | Saves a new layout |
 | `/api/config` | GET | none | Public — returns trigger words + on/off state + custom redirects |
 | `/api/config` | POST | `X-Edit-Key` | Saves config. Admin's trigger/enabled fields are force-overwritten server-side no matter what's submitted (see below) |
-| `/api/chat` | GET | none | Public — returns chat history |
-| `/api/chat` | POST | **none, by design** | Anyone who reaches the chat page can post — but the display name must be claimed with a PIN. See below |
+| `/api/chat/login` | POST | none | Claims a name (first use) or verifies its PIN (later uses), returns a session token — see below |
+| `/api/chat/session` | GET | `X-Chat-Session` | Checks whether a saved session token is still valid, and who it belongs to |
+| `/api/chat` | GET | none | Public — returns global chat history |
+| `/api/chat` | POST | `X-Chat-Session` | Posts to global chat as whoever the session belongs to |
+| `/api/dm/send` | POST | `X-Chat-Session` | Sends a direct message |
+| `/api/dm/threads` | GET | `X-Chat-Session` | Lists the logged-in user's DM conversations with a preview of each |
+| `/api/dm/messages` | GET | `X-Chat-Session` | Full message history with one specific person (`?with=<name>`) |
 | `/api/chat/names` | GET | `X-Edit-Key` | Admin-only — lists every claimed name and when it was claimed (never the PIN) |
 | `/api/chat/names/release` | POST | `X-Edit-Key` | Admin-only — frees a claimed name so it can be claimed fresh |
-| `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all chat messages |
+| `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all global chat messages (DMs are untouched) |
 | `/api/pages` | GET | none | Public — returns the list of custom pages |
 | `/api/pages` | POST | `X-Edit-Key` | Saves/replaces the custom pages array. Slugs may be nested (`test/about-us`) |
 | `/api/pages/token` | POST | none | Mints a short-lived, single-use token for viewing `/page/<slug>` — see below |
@@ -41,7 +49,7 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/presence/count` | GET | `X-Edit-Key` | Admin-only — how many tabs pinged in the last 30 seconds |
 | `/page/<slug>` | GET | token | Serves a stored custom page's raw HTML — only with a valid `?t=` token, see below |
 
-All `POST`/`GET` routes marked `X-Edit-Key` require that header to match the `EDIT_PASSWORD` secret set below.
+All routes marked `X-Edit-Key` require that header to match the `EDIT_PASSWORD` secret set below. Routes marked `X-Chat-Session` require that header to hold a valid token from `/api/chat/login` — see below.
 
 ## How `/page/<slug>` is locked down
 
@@ -104,15 +112,26 @@ Slugs may be nested (`test`, `test/about-us`, `test/about-us/team`, ...) — one
 
 ## About the chat feature
 
-`/api/chat`'s `POST` route still has **no admin password check**, on purpose — anyone who reaches the chat page should be able to post. What it does check now is a per-name PIN:
+There's still **no admin password** involved in chatting — anyone who reaches the chat page can log in and post. What logging in means:
 
-- The first message ever sent under a given name (case-insensitive) **claims** that name: the PIN that came with it is hashed (PBKDF2-SHA256, random per-name salt, via the Workers runtime's Web Crypto support) and stored in `chat_names`. The raw PIN is never stored or logged.
-- Every later message under that name must supply the matching PIN, or the request is rejected with 401 — so nobody else can send messages as an already-claimed name. Messages always render with the exact casing the name was first claimed with, so `bob` and `Bob` can't be used to blur who's who.
-- The admin panel's new Accounts tab lists every claimed name (`GET /api/chat/names`) and can free one up (`POST /api/chat/names/release`) if it needs to change hands.
+- `POST /api/chat/login` with `{name, pin}`. The first time a given name (case-insensitive) is used, that call **claims** it: the PIN is hashed (PBKDF2-SHA256, random per-name salt, via the Workers runtime's Web Crypto support) and stored in `chat_names`. The raw PIN is never stored or logged. Every later login under that name must supply the matching PIN, or the request is rejected with 401.
+- A successful login returns a session token (`chat_session:<token>`, valid 7 days) instead of requiring the PIN again on every message. Posting to global chat and everything DM-related reads the display name from this token, never from anything the client claims in the request body — so nobody can post or DM as a name they haven't logged into. Messages always render with the exact casing the name was first claimed with, so `bob` and `Bob` can't be used to blur who's who.
+- `GET /api/chat/session` lets the site silently check whether a token it already has (e.g. saved in `localStorage` from a previous visit) is still good, which is what makes "log back in and see your history" work without re-entering a PIN every time within that week.
+- The admin panel's Accounts tab lists every claimed name (`GET /api/chat/names`) and can free one up (`POST /api/chat/names/release`) if it needs to change hands.
 - This is a lightweight claim system, not a real account system — there's no rate limiting on PIN guesses, and a very short PIN is guessable. It stops casual impersonation, not a determined attacker.
-- No rate limiting on posting either way. Someone could script requests directly to `/api/chat`, bypassing the page's UI entirely, and flood it (they'd still need a valid PIN for any name they'd already have to know, or they're just claiming new spam names). Message count is capped at 200 (oldest drop off) and name/message/PIN lengths are capped, which bounds *storage* growth but doesn't stop spam from filling that window.
+- No rate limiting on posting either way. Someone could script requests directly to `/api/chat` (with a valid session token), bypassing the page's UI entirely, and flood it. Message count is capped at 200 (oldest drop off) and name/message/PIN lengths are capped, which bounds *storage* growth but doesn't stop spam from filling that window.
 - No moderation or profanity filtering.
-- If you want real protection: [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) in front of the POST, or a [Durable Object](https://developers.cloudflare.com/durable-objects/) for per-IP rate limiting and atomic name claims (the current read-modify-write on `chat_names` has a small race window under simultaneous first-claims). Both are meaningfully more setup than what's here, and intentionally left out to keep this deployable in one pass.
+- If you want real protection: [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) in front of login, or a [Durable Object](https://developers.cloudflare.com/durable-objects/) for per-IP rate limiting and atomic name claims (the current read-modify-write on `chat_names` has a small race window under simultaneous first-claims). Both are meaningfully more setup than what's here, and intentionally left out to keep this deployable in one pass.
+
+## About direct messages
+
+DMs reuse the same login/session system as global chat, with one key difference: **reading is gated too**. Only the two participants in a conversation can fetch its history.
+
+- `POST /api/dm/send` with `{to, text}` — the sender comes from the session token, never the request body. Conversations are keyed by both participants' names, lowercased and sorted (`dmPairKey`), so it doesn't matter who messaged first.
+- Each conversation's messages live in `dm_messages:<pairKey>`, capped at 300 (oldest drop off first), same shape as global chat but with `from` instead of `name`.
+- Every send also updates **both** participants' `dm_threads:<lowerName>` entries — a lightweight inbox index (partner name + last message preview + timestamp) so `GET /api/dm/threads` can render a conversation list without fetching every thread's full history. This is what backs the sidebar in the chat page's UI.
+- `GET /api/dm/messages?with=<name>` returns one conversation's full history for the logged-in user — this is the "log in and see your history" part.
+- There's no delete/edit, no read receipts beyond the client-side unread dot (computed locally from `localStorage`, not synced anywhere), and no admin visibility into DM content by design — the Accounts tab shows *who* has claimed a name, never what they've said to anyone. If you want the admin to be able to moderate DMs later, that's a deliberate addition to make, not an oversight.
 
 ## About the experimental features
 
