@@ -831,6 +831,27 @@ export default {
       return respond(threads);
     }
 
+    // Removes a conversation from the caller's own inbox only — it
+    // does not touch the shared message history or anyone else's
+    // thread list, since a DM's content belongs to every participant,
+    // not just whoever asked to delete it. If someone sends a new
+    // message into the same conversation later, it reappears (same
+    // convId, same participants) — same as most chat apps' "delete
+    // conversation" actually working like "hide until it's active
+    // again."
+    if (url.pathname === "/api/dm/leave" && request.method === "POST") {
+      const name = await getSessionName(request, env);
+      const guard = requireSession(name);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const convId = typeof body.data.convId === "string" ? body.data.convId : "";
+      if (!convId) return respond({ error: "convId is required" }, 400);
+      const threads = await getJSON(env, "dm_threads:" + name.toLowerCase(), []);
+      await putJSON(env, "dm_threads:" + name.toLowerCase(), threads.filter(function (t) { return t.convId !== convId; }));
+      return respond({ ok: true });
+    }
+
     // Full message history for one conversation — this is the "log in
     // and see your history, like iMessage" part. Also returns each
     // participant's last-read timestamp, for read receipts.

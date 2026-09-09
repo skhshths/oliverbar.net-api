@@ -64,6 +64,7 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/dm/edit` / `/api/dm/delete` | POST | `X-Chat-Session` | Edit or soft-delete your own message in a conversation |
 | `/api/dm/react` | POST | `X-Chat-Session` | Toggle your own emoji reaction on a DM |
 | `/api/dm/read` | POST | `X-Chat-Session` | Marks a conversation read up to now, for read receipts |
+| `/api/dm/leave` | POST | `X-Chat-Session` | Removes a conversation from your own inbox only — see below |
 | `/api/chat/names` | GET | `X-Edit-Key` | Admin-only — lists every claimed name, avatar, status, and when claimed (never the PIN) |
 | `/api/chat/names/release` | POST | `X-Edit-Key` | Admin-only — frees a claimed name so it can be claimed fresh |
 | `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all global chat messages and pins (DMs are untouched) |
@@ -201,6 +202,7 @@ DMs reuse the same login/session system as global chat, with two key differences
 - Edit/delete/react work the same as global chat (`/api/dm/edit`, `/api/dm/delete`, `/api/dm/react`), scoped to the conversation and checked against the session name.
 - There's still no admin visibility into DM content by design — the Accounts tab shows *who* has claimed a name, never what they've said to anyone. If you want the admin to be able to moderate DMs later, that's a deliberate addition to make, not an oversight.
 - Groups are capped at 12 people (`MAX_GROUP_PARTICIPANTS`) — an arbitrary but generous limit for a personal project, easy to raise in `index.js` if you need more.
+- **Deleting a conversation** (`POST /api/dm/leave`) only removes it from the caller's own `dm_threads` entry — it doesn't touch `dm_messages`, `dm_conversations`, or anyone else's inbox. A DM's history belongs to every participant, not just whoever asked to delete it, so there's no way to unilaterally erase it for the others. If someone sends a new message into that same conversation later, it reappears in your inbox — same convId, same participants, nothing was actually destroyed.
 
 ## About the experimental features and the Dashboard
 
