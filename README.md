@@ -12,15 +12,21 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 |---|---|
 | `layout` | The interactive page's draggable box layout |
 | `site_config` | The four built-in pages' trigger words / enabled state, plus custom redirects |
-| `chat_messages` | The global chat's message history (capped at 200) |
-| `chat_names` | Claimed chat display names — hashed+salted PIN per name, never the PIN itself |
+| `chat_messages` | The global chat's message history (capped at 200), each with an `id`, `reactions`, and `edited`/`deleted` flags |
+| `chat_pinned` | Snapshots of pinned global chat messages |
+| `chat_names` | Claimed chat display names — hashed+salted PIN, avatar, status, and a `blocked` list per name (never the PIN itself) |
 | `chat_session:<token>` | A logged-in chat identity, valid for 7 days — see below |
-| `dm_messages:<pairKey>` | One conversation's full message history (capped at 300), keyed by both participants' names, sorted |
-| `dm_threads:<lowerName>` | One person's DM inbox — their conversation partners with a preview of the latest message each |
+| `chat_presence:<lowerName>` | One key per logged-in name currently active, expiring after 30s — backs the "online now" badge |
+| `typing:global:<lowerName>` / `typing:dm:<convId>:<lowerName>` | "Still typing" flags, expiring after 5s |
+| `dm_conversations:<convId>` | A conversation's participant list (2 or more people) |
+| `dm_messages:<convId>` | One conversation's full message history (capped at 300) |
+| `dm_threads:<lowerName>` | One person's DM inbox — their conversations with a preview of the latest message each |
+| `dm_read:<convId>:<lowerName>` | When a participant last read a conversation — backs read receipts |
+| `lifetime_stats` | Running totals (messages, DMs, accounts) that survive the capped arrays above rolling old entries off — backs the admin Dashboard |
 | `custom_pages` | Raw HTML pages authored from the admin panel, served back at `/page/<slug>` |
 | `page_token:<token>` | Short-lived (60s), single-use tokens minted right before navigating to a `/page/<slug>` — see below |
-| `trigger_stats` | Usage counts per trigger word, for the admin panel's Experimental tab |
-| `presence:<id>` | One key per open tab, expiring after 30s — a rough "how many people right now" count |
+| `trigger_stats` | Usage counts per trigger word, for the admin panel's Experimental tab and Dashboard |
+| `presence:<id>` | One key per open tab, expiring after 30s — a rough "how many people right now" count (anonymous, unrelated to `chat_presence`) |
 
 ## Routes
 
@@ -32,14 +38,33 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/config` | POST | `X-Edit-Key` | Saves config. Admin's trigger/enabled fields are force-overwritten server-side no matter what's submitted (see below) |
 | `/api/chat/login` | POST | none | Claims a name (first use) or verifies its PIN (later uses), returns a session token — see below |
 | `/api/chat/session` | GET | `X-Chat-Session` | Checks whether a saved session token is still valid, and who it belongs to |
+| `/api/chat/change-pin` | POST | `X-Chat-Session` | Self-service — sets a new PIN for your own name |
+| `/api/chat/release-me` | POST | `X-Chat-Session` | Self-service — deletes your own account, freeing the name |
+| `/api/chat/profile` | GET | `X-Chat-Session` | Batch-fetches avatar + status for `?names=a,b,c` |
+| `/api/chat/profile` | POST | `X-Chat-Session` | Sets your own avatar + status |
+| `/api/chat/block` / `/api/chat/unblock` | POST | `X-Chat-Session` | Add/remove a name from your own block list |
+| `/api/chat/blocks` | GET | `X-Chat-Session` | Your own block list |
+| `/api/chat/presence` | POST | `X-Chat-Session` | Marks your name "online" for 30 seconds |
+| `/api/chat/presence` | GET | `X-Chat-Session` | Checks which of `?names=a,b,c` are currently online |
+| `/api/typing` | POST | `X-Chat-Session` | Marks you as typing in global chat or one DM (`{scope, convId}`), expires in 5s |
+| `/api/typing` | GET | `X-Chat-Session` | Who's currently typing in a given scope |
 | `/api/chat` | GET | none | Public — returns global chat history |
 | `/api/chat` | POST | `X-Chat-Session` | Posts to global chat as whoever the session belongs to |
-| `/api/dm/send` | POST | `X-Chat-Session` | Sends a direct message |
-| `/api/dm/threads` | GET | `X-Chat-Session` | Lists the logged-in user's DM conversations with a preview of each |
-| `/api/dm/messages` | GET | `X-Chat-Session` | Full message history with one specific person (`?with=<name>`) |
-| `/api/chat/names` | GET | `X-Edit-Key` | Admin-only — lists every claimed name and when it was claimed (never the PIN) |
+| `/api/chat/edit` / `/api/chat/delete` | POST | `X-Chat-Session` | Edit or soft-delete your own global chat message |
+| `/api/chat/react` | POST | `X-Chat-Session` | Toggle your own emoji reaction on a global chat message |
+| `/api/chat/pinned` | GET | none | Public — currently pinned global chat messages |
+| `/api/chat/pin` / `/api/chat/unpin` | POST | `X-Edit-Key` | Admin-only — pin/unpin a global chat message |
+| `/api/dm/start` | POST | `X-Chat-Session` | Finds or creates a conversation with 1+ other people (`{participants: [names]}`) |
+| `/api/dm/send` | POST | `X-Chat-Session` | Sends a message into a conversation (`{convId, text}`) |
+| `/api/dm/threads` | GET | `X-Chat-Session` | Lists the logged-in user's conversations with a preview of each |
+| `/api/dm/messages` | GET | `X-Chat-Session` | Full history + read receipts for one conversation (`?convId=`) |
+| `/api/dm/edit` / `/api/dm/delete` | POST | `X-Chat-Session` | Edit or soft-delete your own message in a conversation |
+| `/api/dm/react` | POST | `X-Chat-Session` | Toggle your own emoji reaction on a DM |
+| `/api/dm/read` | POST | `X-Chat-Session` | Marks a conversation read up to now, for read receipts |
+| `/api/chat/names` | GET | `X-Edit-Key` | Admin-only — lists every claimed name, avatar, status, and when claimed (never the PIN) |
 | `/api/chat/names/release` | POST | `X-Edit-Key` | Admin-only — frees a claimed name so it can be claimed fresh |
-| `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all global chat messages (DMs are untouched) |
+| `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all global chat messages and pins (DMs are untouched) |
+| `/api/admin/dashboard` | GET | `X-Edit-Key` | Admin-only — aggregated totals for the Dashboard tab |
 | `/api/pages` | GET | none | Public — returns the list of custom pages |
 | `/api/pages` | POST | `X-Edit-Key` | Saves/replaces the custom pages array. Slugs may be nested (`test/about-us`) |
 | `/api/pages/token` | POST | none | Mints a short-lived, single-use token for viewing `/page/<slug>` — see below |
@@ -117,28 +142,38 @@ There's still **no admin password** involved in chatting — anyone who reaches 
 - `POST /api/chat/login` with `{name, pin}`. The first time a given name (case-insensitive) is used, that call **claims** it: the PIN is hashed (PBKDF2-SHA256, random per-name salt, via the Workers runtime's Web Crypto support) and stored in `chat_names`. The raw PIN is never stored or logged. Every later login under that name must supply the matching PIN, or the request is rejected with 401.
 - A successful login returns a session token (`chat_session:<token>`, valid 7 days) instead of requiring the PIN again on every message. Posting to global chat and everything DM-related reads the display name from this token, never from anything the client claims in the request body — so nobody can post or DM as a name they haven't logged into. Messages always render with the exact casing the name was first claimed with, so `bob` and `Bob` can't be used to blur who's who.
 - `GET /api/chat/session` lets the site silently check whether a token it already has (e.g. saved in `localStorage` from a previous visit) is still good, which is what makes "log back in and see your history" work without re-entering a PIN every time within that week.
-- The admin panel's Accounts tab lists every claimed name (`GET /api/chat/names`) and can free one up (`POST /api/chat/names/release`) if it needs to change hands.
-- This is a lightweight claim system, not a real account system — there's no rate limiting on PIN guesses, and a very short PIN is guessable. It stops casual impersonation, not a determined attacker.
+- The admin panel's Accounts tab lists every claimed name (`GET /api/chat/names`) and can free one up (`POST /api/chat/names/release`) if it needs to change hands. Anyone can also do this to themselves via `POST /api/chat/release-me`, and change their own PIN via `POST /api/chat/change-pin` without knowing the old one (the session itself is proof enough).
+- Each account also carries a self-service **avatar** (a short emoji, `GET`/`POST /api/chat/profile`) and **status line** (max 40 characters, same endpoint), both freely visible to anyone logged in — think of them as public, not secrets.
+- **Blocking** (`POST /api/chat/block` / `/unblock`, `GET /api/chat/blocks`) is per-account and enforced server-side for 1:1 conversations: if someone has blocked you, `/api/dm/start` and `/api/dm/send` both refuse outright. It isn't enforced for group conversations (3+ people) — a deliberate scope cut, documented as a limitation rather than silently half-working. Global chat isn't filtered server-side either; the block list is just exposed for the chat page to filter its own rendering.
+- **Typing indicators** (`POST`/`GET /api/typing`) and the **online-now badge** (`POST`/`GET /api/chat/presence`) both work the same way: a KV key per identity with a few seconds' TTL, refreshed by a client-side ping loop. Neither is meant to be precise — they're "as of the last few seconds," same spirit as the anonymous presence counter.
+- **Edit and delete** (`POST /api/chat/edit` / `/api/chat/delete`) only work on your own messages (checked server-side against the session name, not just hidden client-side). Delete is a soft tombstone — the message stays in the array with `deleted: true` and `text: null` so the conversation doesn't jump around, and reactions are cleared.
+- **Reactions** (`POST /api/chat/react`) toggle: react again with the same emoji to remove it. Stored inline on the message as `reactions: { "👍": ["Alice", "Bob"] }`.
+- **Pinned messages** (`GET /api/chat/pinned`, `POST /api/chat/pin` / `/unpin`) are admin-only to set — gated by `X-Edit-Key`, same as everything else the admin password protects — but public to read, since the point is for every visitor to see them.
+- This is still a lightweight claim system, not a real account system — there's no rate limiting on PIN guesses, and a very short PIN is guessable. It stops casual impersonation, not a determined attacker.
 - No rate limiting on posting either way. Someone could script requests directly to `/api/chat` (with a valid session token), bypassing the page's UI entirely, and flood it. Message count is capped at 200 (oldest drop off) and name/message/PIN lengths are capped, which bounds *storage* growth but doesn't stop spam from filling that window.
 - No moderation or profanity filtering.
 - If you want real protection: [Cloudflare Turnstile](https://developers.cloudflare.com/turnstile/) in front of login, or a [Durable Object](https://developers.cloudflare.com/durable-objects/) for per-IP rate limiting and atomic name claims (the current read-modify-write on `chat_names` has a small race window under simultaneous first-claims). Both are meaningfully more setup than what's here, and intentionally left out to keep this deployable in one pass.
 
 ## About direct messages
 
-DMs reuse the same login/session system as global chat, with one key difference: **reading is gated too**. Only the two participants in a conversation can fetch its history.
+DMs reuse the same login/session system as global chat, with two key differences: **reading is gated** (only a conversation's participants can fetch its history), and conversations can have **more than two people**.
 
-- `POST /api/dm/send` with `{to, text}` — the sender comes from the session token, never the request body. Conversations are keyed by both participants' names, lowercased and sorted (`dmPairKey`), so it doesn't matter who messaged first.
-- Each conversation's messages live in `dm_messages:<pairKey>`, capped at 300 (oldest drop off first), same shape as global chat but with `from` instead of `name`.
-- Every send also updates **both** participants' `dm_threads:<lowerName>` entries — a lightweight inbox index (partner name + last message preview + timestamp) so `GET /api/dm/threads` can render a conversation list without fetching every thread's full history. This is what backs the sidebar in the chat page's UI.
-- `GET /api/dm/messages?with=<name>` returns one conversation's full history for the logged-in user — this is the "log in and see your history" part.
-- There's no delete/edit, no read receipts beyond the client-side unread dot (computed locally from `localStorage`, not synced anywhere), and no admin visibility into DM content by design — the Accounts tab shows *who* has claimed a name, never what they've said to anyone. If you want the admin to be able to moderate DMs later, that's a deliberate addition to make, not an oversight.
+- `POST /api/dm/start` with `{participants: [names]}` finds an existing conversation with exactly that set of people (self included, compared case-insensitively regardless of order) or creates a new one, storing `dm_conversations:<convId> → {participants, createdAt}`. This is what makes group chats and 1:1s the same underlying concept — a 1:1 is just a 2-person conversation.
+- `POST /api/dm/send` with `{convId, text}` — the sender comes from the session token, never the request body, and the Worker checks the sender is actually a participant before accepting. Messages live in `dm_messages:<convId>`, capped at 300, same shape as global chat (`id`, `text`, `ts`, `reactions`, `edited`/`deleted`) but with `from` instead of `name`.
+- Every send updates **every** participant's `dm_threads:<lowerName>` inbox index (conversation id, participant list, last message preview) so `GET /api/dm/threads` can render a conversation list without fetching every conversation's full history.
+- `GET /api/dm/messages?convId=<id>` returns `{messages, participants, reads}` for the logged-in user — the messages, the full participant list, and everyone's last-read timestamp (see read receipts below). This is the "log in and see your history" part.
+- **Read receipts**: `POST /api/dm/read` records a per-participant last-read timestamp for a conversation (`dm_read:<convId>:<lowerName>`). The chat page shows "Seen" under your own last message once every other participant's last-read timestamp is at or past it — for a group, that means everyone, not just one person.
+- Edit/delete/react work the same as global chat (`/api/dm/edit`, `/api/dm/delete`, `/api/dm/react`), scoped to the conversation and checked against the session name.
+- There's still no admin visibility into DM content by design — the Accounts tab shows *who* has claimed a name, never what they've said to anyone. If you want the admin to be able to moderate DMs later, that's a deliberate addition to make, not an oversight.
+- Groups are capped at 12 people (`MAX_GROUP_PARTICIPANTS`) — an arbitrary but generous limit for a personal project, easy to raise in `index.js` if you need more.
 
-## About the experimental features
+## About the experimental features and the Dashboard
 
-Two small, low-stakes additions that back the admin panel's Experimental tab:
+A few small, low-stakes additions:
 
-- **Trigger usage stats** — `index.html` fires a fire-and-forget `POST /api/stats/trigger` every time a trigger word matches. Purely a curiosity counter (which pages get used most); nothing else reads it, and the write side has no auth since it's just a counter increment.
-- **Live presence** — `index.html` quietly pings `POST /api/presence/ping` every 20 seconds with a random per-tab id, no UI change. Each ping is a KV key with a 30-second TTL, so `GET /api/presence/count` (admin-only) is "how many tabs pinged recently" — a fun, rough number, not precise analytics. `KV.list()` is capped at 1000 keys for this, plenty for a personal site.
+- **Trigger usage stats** — `index.html` fires a fire-and-forget `POST /api/stats/trigger` every time a trigger word matches. Purely a curiosity counter (which pages get used most); the write side has no auth since it's just a counter increment.
+- **Live presence** — `index.html` quietly pings `POST /api/presence/ping` every 20 seconds with a random per-tab id, no UI change. Each ping is a KV key with a 30-second TTL, so `GET /api/presence/count` (admin-only) is "how many tabs pinged recently" — a fun, rough number, not precise analytics. `KV.list()` is capped at 1000 keys for this, plenty for a personal site. (This is separate from `chat_presence`, which tracks logged-in identities rather than anonymous tabs.)
+- **The Dashboard tab** (`GET /api/admin/dashboard`) rolls several of the above into one call: lifetime message/DM counts (from `lifetime_stats`, which isn't affected by the capped message arrays rolling old entries off), total claimed accounts, the single most-used trigger, and the live presence count. It's the new default landing tab in the admin panel.
 
 ## Security model, and its limits
 
