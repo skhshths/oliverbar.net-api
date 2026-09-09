@@ -24,6 +24,7 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `dm_read:<convId>:<lowerName>` | When a participant last read a conversation — backs read receipts |
 | `last_seen:<lowerName>` | Last activity timestamp per name, never expires — backs "last seen 5m ago" once `chat_presence` has expired |
 | `lifetime_stats` | Running totals (messages, DMs, accounts) that survive the capped arrays above rolling old entries off — backs the admin Dashboard |
+| `games` | The games hub's list — `{id, title, url, enabled}` per entry, rendered as buttons and opened as fullscreen embeds |
 | `custom_pages` | Raw HTML pages authored from the admin panel, served back at `/page/<slug>` |
 | `page_token:<token>` | Short-lived (60s), single-use tokens minted right before navigating to a `/page/<slug>` — see below |
 | `guest_pass:<token>` | Multi-use, admin-created, time-boxed access to one Custom Page — see below |
@@ -77,6 +78,8 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/config/disable-custom` | POST | none | Disables one custom redirect by id — called after a one-time trigger fires |
 | `/api/pages/random` | GET | none | Picks a random enabled Custom Page slug — backs "random page" triggers |
 | `/api/notes/create` | POST | `X-Edit-Key` | Admin-only — creates a burn-after-reading note, returns its id |
+| `/api/games` | GET | none | Public — the games hub's list (the hub page needs it unauthenticated) |
+| `/api/games` | POST | `X-Edit-Key` | Admin-only — saves/replaces the games array. URLs must be `https://` — see below |
 | `/api/pages` | GET | none | Public — returns the list of custom pages |
 | `/api/pages` | POST | `X-Edit-Key` | Saves/replaces the custom pages array. Slugs may be nested (`test/about-us`) |
 | `/api/pages/token` | POST | none | Mints a short-lived, single-use token for viewing `/page/<slug>` — see below |
@@ -162,6 +165,15 @@ Earlier iterations let the `admin` entry's trigger word and enabled flag be edit
    Wrangler prints your Worker's `*.workers.dev` URL. If you're pointing custom domains at it (like `api.oliverbar.net` / `pages.oliverbar.net` here), add those under **Cloudflare dashboard → Worker → Settings → Domains & Routes → Add → Custom Domain**. This also runs automatically on every push to `main` if the repo is connected via Cloudflare's Git integration (Workers Builds).
 
 7. **Wire it up to the site** — paste the Worker's URL (or custom domain) into the `API_BASE` constant near the top of every page in the site repo that has one: `index.html`, the admin page, the interactive page, and the chat page. Re-upload to Cloudflare Pages.
+
+## About the games hub
+
+`GET`/`POST /api/games` stores a flat list of `{id, title, url, enabled}`. The games page (reached with the `games` built-in trigger, `game123` by default) renders each enabled entry as a button and opens it in a fullscreen iframe.
+
+Two things worth knowing before adding entries:
+
+- **URLs are validated as `https://` server-side**, not just in the admin UI. That value ends up as an `iframe src` on a page under your own domain, so `javascript:`, `data:`, and anything else has to be refused here — the admin UI's matching check is only there to catch typos early.
+- **Plenty of sites can't be embedded at all.** Any host sending `X-Frame-Options: DENY` or a restrictive `frame-ancestors` will render blank in the iframe no matter what, and there is no client-side workaround — that's the browser enforcing the host's choice. If a game has to work reliably, host it yourself: a self-contained HTML5 game pasted into a **Custom Page** is served from this Worker, is same-origin-ish, and can't be taken away by someone else's server going down or reorganizing. Hotlinking a third-party game host is the fragile option, not the robust one.
 
 ## About the "custom pages" feature
 

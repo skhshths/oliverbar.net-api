@@ -6,8 +6,13 @@ const DEFAULT_CONFIG = {
   interactive: { label: "Interactive", trigger: "interactive",       enabled: true },
   portfolio:   { label: "Portfolio",   trigger: "portfolio",         enabled: true },
   chat:        { label: "Chat",        trigger: "chat",              enabled: true },
+  games:       { label: "Games",       trigger: "game123",           enabled: true },
   custom: [],
 };
+
+const MAX_GAMES = 100;
+const MAX_GAME_TITLE_LENGTH = 60;
+const MAX_GAME_URL_LENGTH = 500;
 
 const MAX_CHAT_MESSAGES = 200;
 const MAX_DM_MESSAGES = 300;
@@ -1120,6 +1125,46 @@ export default {
       const token = crypto.randomUUID();
       await putJSON(env, "guest_pass:" + token, { slug: slug }, { expirationTtl: minutes * 60 });
       return respond({ token: token, minutes: minutes });
+    }
+
+    // ---------- Games hub ----------
+    // A plain list of {id, title, url} the games page renders as a grid
+    // and opens in a fullscreen iframe. Reading is public (the hub page
+    // needs it); writing is admin-only, same as every other config.
+    if (url.pathname === "/api/games" && request.method === "GET") {
+      const games = await getJSON(env, "games", []);
+      return respond(games);
+    }
+
+    if (url.pathname === "/api/games" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      if (!Array.isArray(body.data)) return respond({ error: "Expected an array of games" }, 400);
+      if (body.data.length > MAX_GAMES) return respond({ error: "Too many games (max " + MAX_GAMES + ")" }, 400);
+
+      // The URL check matters: this value ends up as an iframe src on a
+      // page we control, so anything but http(s) — javascript:, data:,
+      // and friends — has to be refused here, not just in the admin UI.
+      const badEntry = body.data.find(function (g) {
+        return !(
+          g &&
+          typeof g.id === "string" && g.id.length > 0 &&
+          typeof g.title === "string" && g.title.trim().length > 0 && g.title.length <= MAX_GAME_TITLE_LENGTH &&
+          typeof g.url === "string" && /^https:\/\//i.test(g.url) && g.url.length <= MAX_GAME_URL_LENGTH &&
+          typeof g.enabled === "boolean"
+        );
+      });
+      if (badEntry) {
+        return respond({
+          error: "Each game needs a title and an https:// URL",
+          badTitle: badEntry && typeof badEntry.title === "string" ? badEntry.title : "(untitled)",
+        }, 400);
+      }
+
+      await putJSON(env, "games", body.data);
+      return respond({ ok: true });
     }
 
     // ---------- Custom pages (self-serve HTML, no Cloudflare Pages deploy needed) ----------
