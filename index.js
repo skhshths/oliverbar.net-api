@@ -26,6 +26,20 @@ const PRESENCE_TTL_SECONDS = 30; // an anonymous site-wide presence ping counts 
 const CHAT_PRESENCE_TTL_SECONDS = 30; // same idea, but tied to a logged-in name for the "online now" badge
 const TYPING_TTL_SECONDS = 5; // how long a "still typing" flag lasts without a fresh ping
 const CHAT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // how long a chat login stays valid
+const SECRET_NOTE_TTL_SECONDS = 30 * 24 * 60 * 60; // an unread burn-after-reading note expires after 30 days
+const MAX_SECRET_NOTE_LENGTH = 2000;
+const GUEST_PASS_MIN_MINUTES = 1;
+const GUEST_PASS_MAX_MINUTES = 24 * 60; // 1 day
+const MAX_ALIASES = 5;
+
+// Keys the admin panel's raw KV inspector is allowed to read. Deliberately
+// excludes anything DM-, session-, token-, or PIN-related — the whole
+// point of that exclusion is that even the admin can't casually read
+// someone's private messages through a debug tool.
+const KV_INSPECTOR_ALLOWLIST = [
+  "site_config", "custom_pages", "chat_messages", "chat_pinned",
+  "trigger_stats", "lifetime_stats", "layout",
+];
 
 function randomHex(byteLength) {
   const bytes = new Uint8Array(byteLength);
@@ -152,6 +166,22 @@ async function saveNames(env, names) {
   await putJSON(env, "chat_names", names);
 }
 
+// Touched on login, posting, and presence pings — this is what backs
+// "last seen 5m ago" once someone's chat_presence key has expired.
+// Unlike chat_presence, this key never expires on its own.
+async function touchLastSeen(env, name) {
+  await env.LAYOUT_KV.put("last_seen:" + name.toLowerCase(), String(Date.now()));
+}
+
+async function bumpMessageCount(env, name) {
+  const names = await loadNames(env);
+  const rec = names[name.toLowerCase()];
+  if (rec) {
+    rec.messageCount = (rec.messageCount || 0) + 1;
+    await saveNames(env, names);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -276,13 +306,24 @@ export default {
           });
         }
         const customValid = parsed.custom.every(function (item) {
-          return (
+          if (!(
             item &&
             typeof item.id === "string" && item.id.length > 0 &&
             typeof item.trigger === "string" && item.trigger.length > 0 &&
             typeof item.destination === "string" && item.destination.length > 0 &&
             typeof item.enabled === "boolean"
-          );
+          )) return false;
+          // Everything below is optional — old entries won't have any
+          // of it, and that's fine.
+          if (item.aliases !== undefined) {
+            if (!Array.isArray(item.aliases) || item.aliases.length > MAX_ALIASES) return false;
+            if (!item.aliases.every(function (a) { return typeof a === "string"; })) return false;
+          }
+          if (item.oneTime !== undefined && typeof item.oneTime !== "boolean") return false;
+          if (item.random !== undefined && typeof item.random !== "boolean") return false;
+          if (item.activeFrom !== undefined && item.activeFrom !== null && typeof item.activeFrom !== "number") return false;
+          if (item.activeUntil !== undefined && item.activeUntil !== null && typeof item.activeUntil !== "number") return false;
+          return true;
         });
         if (!customValid) {
           return new Response(JSON.stringify({ error: "Malformed custom entry" }), {
@@ -335,6 +376,7 @@ export default {
 
       const token = crypto.randomUUID();
       await putJSON(env, "chat_session:" + token, { name: result.name }, { expirationTtl: CHAT_SESSION_TTL_SECONDS });
+      await touchLastSeen(env, result.name);
 
       return respond({ token: token, name: result.name });
     }
@@ -364,7 +406,7 @@ export default {
       const result = {};
       requested.forEach(function (n) {
         const rec = names[n.toLowerCase()];
-        result[n] = rec ? { name: rec.name, avatar: rec.avatar || "", status: rec.status || "" } : null;
+        result[n] = rec ? { name: rec.name, avatar: rec.avatar || "", status: rec.status || "", messageCount: rec.messageCount || 0 } : null;
       });
       return respond(result);
     }
@@ -512,9 +554,14 @@ export default {
       const guard = requireSession(name);
       if (guard) return guard;
       await env.LAYOUT_KV.put("chat_presence:" + name.toLowerCase(), "1", { expirationTtl: CHAT_PRESENCE_TTL_SECONDS });
+      await touchLastSeen(env, name);
       return respond({ ok: true });
     }
 
+    // Returns both an "online now" flag and a lastSeen timestamp per
+    // requested name — the flag comes from the short-TTL chat_presence
+    // key, the timestamp from last_seen (which never expires), so the
+    // chat page can show "online" or "last seen 5m ago" as appropriate.
     if (url.pathname === "/api/chat/presence" && request.method === "GET") {
       const requester = await getSessionName(request, env);
       const guard = requireSession(requester);
@@ -523,8 +570,12 @@ export default {
       const requested = namesParam.split(",").map(function (n) { return n.trim(); }).filter(Boolean);
       const result = {};
       await Promise.all(requested.map(async function (n) {
-        const stored = await env.LAYOUT_KV.get("chat_presence:" + n.toLowerCase());
-        result[n] = !!stored;
+        const key = n.toLowerCase();
+        const [online, lastSeen] = await Promise.all([
+          env.LAYOUT_KV.get("chat_presence:" + key),
+          env.LAYOUT_KV.get("last_seen:" + key),
+        ]);
+        result[n] = { online: !!online, lastSeen: lastSeen ? Number(lastSeen) : null };
       }));
       return respond(result);
     }
@@ -551,13 +602,20 @@ export default {
 
       const text = typeof body.data.text === "string" ? body.data.text.trim().slice(0, MAX_MESSAGE_LENGTH) : "";
       if (!text) return respond({ error: "text is required" }, 400);
+      const replyToId = typeof body.data.replyTo === "string" ? body.data.replyTo : "";
 
       const messages = await getJSON(env, "chat_messages", []);
       const message = { id: randomHex(6), name: name, text: text, ts: Date.now(), reactions: {} };
+      if (replyToId) {
+        const original = messages.find(function (m) { return m.id === replyToId; });
+        if (original) message.replyTo = { id: original.id, who: original.name, text: original.deleted ? null : original.text };
+      }
       messages.push(message);
       const trimmed = messages.length > MAX_CHAT_MESSAGES ? messages.slice(messages.length - MAX_CHAT_MESSAGES) : messages;
       await putJSON(env, "chat_messages", trimmed);
       await bumpLifetimeStat(env, "totalGlobalMessages");
+      await bumpMessageCount(env, name);
+      await touchLastSeen(env, name);
       return respond({ ok: true, name: name, id: message.id });
     }
 
@@ -742,12 +800,19 @@ export default {
         }
       }
 
+      const replyToId = typeof body.data.replyTo === "string" ? body.data.replyTo : "";
       const messages = await getJSON(env, "dm_messages:" + convId, []);
       const message = { id: randomHex(6), from: fromName, text: text, ts: Date.now(), reactions: {} };
+      if (replyToId) {
+        const original = messages.find(function (m) { return m.id === replyToId; });
+        if (original) message.replyTo = { id: original.id, who: original.from, text: original.deleted ? null : original.text };
+      }
       messages.push(message);
       const trimmed = messages.length > MAX_DM_MESSAGES ? messages.slice(messages.length - MAX_DM_MESSAGES) : messages;
       await putJSON(env, "dm_messages:" + convId, trimmed);
       await bumpLifetimeStat(env, "totalDmMessages");
+      await bumpMessageCount(env, fromName);
+      await touchLastSeen(env, fromName);
 
       await Promise.all(conversation.participants.map(function (p) { return upsertThread(env, p, conversation, message); }));
 
@@ -889,7 +954,11 @@ export default {
       try { names = namesStored ? JSON.parse(namesStored) : {}; } catch (e) { names = {}; }
 
       const list = Object.keys(names).map(function (key) {
-        return { name: names[key].name, createdAt: names[key].createdAt, avatar: names[key].avatar || "", status: names[key].status || "" };
+        return {
+          name: names[key].name, createdAt: names[key].createdAt,
+          avatar: names[key].avatar || "", status: names[key].status || "",
+          messageCount: names[key].messageCount || 0,
+        };
       }).sort(function (a, b) { return a.createdAt - b.createdAt; });
 
       return new Response(JSON.stringify(list), {
@@ -956,6 +1025,80 @@ export default {
         topTrigger: topTrigger,
         liveNow: presenceList.keys.length,
       });
+    }
+
+    // ---------- Backup / restore ----------
+    // Exports (and can re-import) the two things worth backing up before
+    // a risky admin-panel change: the trigger/redirect config and the
+    // custom pages. Deliberately doesn't include chat/DM data — that's
+    // live user content, not site configuration.
+    if (url.pathname === "/api/admin/export" && request.method === "GET") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const [config, pages] = await Promise.all([
+        getJSON(env, "site_config", DEFAULT_CONFIG),
+        getJSON(env, "custom_pages", []),
+      ]);
+      return respond({ exportedAt: Date.now(), config: config, pages: pages });
+    }
+
+    if (url.pathname === "/api/admin/import" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const config = body.data.config;
+      const pages = body.data.pages;
+      if (!config || typeof config !== "object") return respond({ error: "Missing config" }, 400);
+      if (!Array.isArray(pages)) return respond({ error: "Missing pages array" }, 400);
+
+      // Same backstop as a normal /api/config save — an imported backup
+      // can't reintroduce a disabled or renamed admin trigger either.
+      config.admin = config.admin || {};
+      config.admin.enabled = true;
+      config.admin.trigger = ADMIN_TRIGGER_FIXED;
+      if (!Array.isArray(config.custom)) config.custom = [];
+
+      await putJSON(env, "site_config", config);
+      await putJSON(env, "custom_pages", pages);
+      return respond({ ok: true });
+    }
+
+    // ---------- Raw KV inspector (admin-only, allowlisted keys only) ----------
+    if (url.pathname === "/api/admin/kv" && request.method === "GET") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      return respond({ keys: KV_INSPECTOR_ALLOWLIST });
+    }
+
+    if (url.pathname === "/api/admin/kv/value" && request.method === "GET") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const key = url.searchParams.get("key") || "";
+      if (KV_INSPECTOR_ALLOWLIST.indexOf(key) === -1) return respond({ error: "That key isn't inspectable" }, 400);
+      const stored = await env.LAYOUT_KV.get(key);
+      return respond({ key: key, value: stored || null });
+    }
+
+    // ---------- Guest passes ----------
+    // Like /api/pages/token, but multi-use within a longer window,
+    // meant to be shared with someone who doesn't know the trigger
+    // word at all. Admin-only to create.
+    if (url.pathname === "/api/admin/guest-pass" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const slug = typeof body.data.slug === "string" ? body.data.slug : "";
+      let minutes = Number(body.data.minutes) || 10;
+      minutes = Math.min(GUEST_PASS_MAX_MINUTES, Math.max(GUEST_PASS_MIN_MINUTES, minutes));
+      if (!slug) return respond({ error: "slug is required" }, 400);
+      const pages = await getJSON(env, "custom_pages", []);
+      if (!pages.find(function (p) { return p.slug === slug; })) return respond({ error: "No custom page with that slug" }, 404);
+
+      const token = crypto.randomUUID();
+      await putJSON(env, "guest_pass:" + token, { slug: slug }, { expirationTtl: minutes * 60 });
+      return respond({ token: token, minutes: minutes });
     }
 
     // ---------- Custom pages (self-serve HTML, no Cloudflare Pages deploy needed) ----------
@@ -1100,6 +1243,67 @@ export default {
       });
     }
 
+    // A one-time custom redirect disables itself the moment it's used —
+    // called by index.html right after a match, alongside the usage
+    // counter above. No auth needed: firing it at all already required
+    // knowing the trigger word, the same trust level as the stats ping.
+    if (url.pathname === "/api/config/disable-custom" && request.method === "POST") {
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const id = typeof body.data.id === "string" ? body.data.id : "";
+      if (!id) return respond({ error: "id is required" }, 400);
+      const config = await getJSON(env, "site_config", null);
+      if (!config || !Array.isArray(config.custom)) return respond({ ok: true });
+      const item = config.custom.find(function (c) { return c.id === id; });
+      if (item) {
+        item.enabled = false;
+        await putJSON(env, "site_config", config);
+      }
+      return respond({ ok: true });
+    }
+
+    // Picks a random enabled custom page — backs a "random page" trigger
+    // in the admin panel (a custom redirect with random:true skips its
+    // destination and lands here instead).
+    if (url.pathname === "/api/pages/random" && request.method === "GET") {
+      const pages = await getJSON(env, "custom_pages", []);
+      if (!pages.length) return respond({ slug: null });
+      const pick = pages[Math.floor(Math.random() * pages.length)];
+      return respond({ slug: pick.slug });
+    }
+
+    // ---------- Burn-after-reading secret notes ----------
+    // Admin-created (this is a personal tool, not a public feature —
+    // anyone could otherwise use this Worker as a free anonymous
+    // paste bin). Reading one deletes it immediately, so it can only
+    // ever be opened once, by whoever gets the link first.
+    if (url.pathname === "/api/notes/create" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const text = typeof body.data.text === "string" ? body.data.text.trim().slice(0, MAX_SECRET_NOTE_LENGTH) : "";
+      if (!text) return respond({ error: "text is required" }, 400);
+      const id = randomHex(8);
+      await putJSON(env, "secret_note:" + id, { text: text }, { expirationTtl: SECRET_NOTE_TTL_SECONDS });
+      return respond({ id: id });
+    }
+
+    if (url.pathname.startsWith("/secret/") && request.method === "GET") {
+      const id = url.pathname.slice("/secret/".length);
+      const note = await getJSON(env, "secret_note:" + id, null);
+      if (note) await env.LAYOUT_KV.delete("secret_note:" + id);
+      const body = note
+        ? "<p>" + note.text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>") + "</p><p class=\"gone\">This note is now gone — nobody, including you, can open this link again.</p>"
+        : "<p class=\"gone\">This note doesn't exist, or it's already been read.</p>";
+      const html = "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>.</title>" +
+        "<style>body{background:#141413;color:#faf9f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;" +
+        "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:24px;box-sizing:border-box;}" +
+        ".box{background:#262624;border:1px solid #45443f;border-radius:14px;padding:28px;max-width:480px;line-height:1.6;font-size:15px;word-wrap:break-word;}" +
+        ".gone{color:#b0aea5;font-size:12px;margin-top:16px;}</style></head><body><div class=\"box\">" + body + "</div></body></html>";
+      return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", ...corsHeaders } });
+    }
+
     if (url.pathname === "/api/stats/trigger" && request.method === "GET") {
       const editKey = request.headers.get("X-Edit-Key") || "";
       if (editKey !== env.EDIT_PASSWORD) {
@@ -1166,24 +1370,29 @@ export default {
     if (url.pathname.startsWith("/page/") && request.method === "GET") {
       const slug = url.pathname.slice("/page/".length);
       const token = url.searchParams.get("t") || "";
+      const guestToken = url.searchParams.get("g") || "";
 
-      if (!token) {
-        return Response.redirect(ROOT_SITE, 302);
+      let authorized = false;
+
+      if (token) {
+        const tokenRecord = await env.LAYOUT_KV.get("page_token:" + token);
+        // Single-use regardless of outcome — a second request with the
+        // same token (e.g. a reload) must never succeed.
+        if (tokenRecord) await env.LAYOUT_KV.delete("page_token:" + token);
+        if (tokenRecord) {
+          let tokenData;
+          try { tokenData = JSON.parse(tokenRecord); } catch (e) { tokenData = null; }
+          if (tokenData && tokenData.slug === slug) authorized = true;
+        }
+      } else if (guestToken) {
+        // Guest passes are multi-use within their window — checked, not
+        // consumed, so the same shared link works for every visitor
+        // until it expires on its own.
+        const passData = await getJSON(env, "guest_pass:" + guestToken, null);
+        if (passData && passData.slug === slug) authorized = true;
       }
 
-      const tokenRecord = await env.LAYOUT_KV.get("page_token:" + token);
-      // Single-use regardless of outcome — a second request with the
-      // same token (e.g. a reload) must never succeed.
-      if (tokenRecord) {
-        await env.LAYOUT_KV.delete("page_token:" + token);
-      }
-      if (!tokenRecord) {
-        return Response.redirect(ROOT_SITE, 302);
-      }
-
-      let tokenData;
-      try { tokenData = JSON.parse(tokenRecord); } catch (e) { tokenData = null; }
-      if (!tokenData || tokenData.slug !== slug) {
+      if (!authorized) {
         return Response.redirect(ROOT_SITE, 302);
       }
 

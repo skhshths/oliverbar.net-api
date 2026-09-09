@@ -22,9 +22,12 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `dm_messages:<convId>` | One conversation's full message history (capped at 300) |
 | `dm_threads:<lowerName>` | One person's DM inbox — their conversations with a preview of the latest message each |
 | `dm_read:<convId>:<lowerName>` | When a participant last read a conversation — backs read receipts |
+| `last_seen:<lowerName>` | Last activity timestamp per name, never expires — backs "last seen 5m ago" once `chat_presence` has expired |
 | `lifetime_stats` | Running totals (messages, DMs, accounts) that survive the capped arrays above rolling old entries off — backs the admin Dashboard |
 | `custom_pages` | Raw HTML pages authored from the admin panel, served back at `/page/<slug>` |
 | `page_token:<token>` | Short-lived (60s), single-use tokens minted right before navigating to a `/page/<slug>` — see below |
+| `guest_pass:<token>` | Multi-use, admin-created, time-boxed access to one Custom Page — see below |
+| `secret_note:<id>` | An unread burn-after-reading note, deleted the moment it's viewed |
 | `trigger_stats` | Usage counts per trigger word, for the admin panel's Experimental tab and Dashboard |
 | `presence:<id>` | One key per open tab, expiring after 30s — a rough "how many people right now" count (anonymous, unrelated to `chat_presence`) |
 
@@ -45,7 +48,7 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/chat/block` / `/api/chat/unblock` | POST | `X-Chat-Session` | Add/remove a name from your own block list |
 | `/api/chat/blocks` | GET | `X-Chat-Session` | Your own block list |
 | `/api/chat/presence` | POST | `X-Chat-Session` | Marks your name "online" for 30 seconds |
-| `/api/chat/presence` | GET | `X-Chat-Session` | Checks which of `?names=a,b,c` are currently online |
+| `/api/chat/presence` | GET | `X-Chat-Session` | For `?names=a,b,c`, returns `{name: {online, lastSeen}}` |
 | `/api/typing` | POST | `X-Chat-Session` | Marks you as typing in global chat or one DM (`{scope, convId}`), expires in 5s |
 | `/api/typing` | GET | `X-Chat-Session` | Who's currently typing in a given scope |
 | `/api/chat` | GET | none | Public — returns global chat history |
@@ -65,6 +68,14 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/chat/names/release` | POST | `X-Edit-Key` | Admin-only — frees a claimed name so it can be claimed fresh |
 | `/api/chat/clear` | POST | `X-Edit-Key` | Wipes all global chat messages and pins (DMs are untouched) |
 | `/api/admin/dashboard` | GET | `X-Edit-Key` | Admin-only — aggregated totals for the Dashboard tab |
+| `/api/admin/export` | GET | `X-Edit-Key` | Admin-only — downloads `{config, pages}` as one backup |
+| `/api/admin/import` | POST | `X-Edit-Key` | Admin-only — restores `{config, pages}` from a backup, overwriting both |
+| `/api/admin/kv` | GET | `X-Edit-Key` | Admin-only — lists the allowlisted keys the raw KV inspector can read |
+| `/api/admin/kv/value` | GET | `X-Edit-Key` | Admin-only — raw value of one allowlisted key (`?key=`) |
+| `/api/admin/guest-pass` | POST | `X-Edit-Key` | Admin-only — mints a multi-use, time-boxed pass to one Custom Page (`{slug, minutes}`) |
+| `/api/config/disable-custom` | POST | none | Disables one custom redirect by id — called after a one-time trigger fires |
+| `/api/pages/random` | GET | none | Picks a random enabled Custom Page slug — backs "random page" triggers |
+| `/api/notes/create` | POST | `X-Edit-Key` | Admin-only — creates a burn-after-reading note, returns its id |
 | `/api/pages` | GET | none | Public — returns the list of custom pages |
 | `/api/pages` | POST | `X-Edit-Key` | Saves/replaces the custom pages array. Slugs may be nested (`test/about-us`) |
 | `/api/pages/token` | POST | none | Mints a short-lived, single-use token for viewing `/page/<slug>` — see below |
@@ -72,7 +83,8 @@ No database, no SQL — everything here is a handful of JSON blobs in Workers KV
 | `/api/stats/trigger` | GET | `X-Edit-Key` | Admin-only — returns usage counts per trigger |
 | `/api/presence/ping` | POST | none | Marks a tab as "here" for 30 seconds |
 | `/api/presence/count` | GET | `X-Edit-Key` | Admin-only — how many tabs pinged in the last 30 seconds |
-| `/page/<slug>` | GET | token | Serves a stored custom page's raw HTML — only with a valid `?t=` token, see below |
+| `/page/<slug>` | GET | `?t=` or `?g=` | Serves a stored custom page's raw HTML — a single-use token or a valid guest pass, see below |
+| `/secret/<id>` | GET | none | Serves and immediately deletes a burn-after-reading note |
 
 All routes marked `X-Edit-Key` require that header to match the `EDIT_PASSWORD` secret set below. Routes marked `X-Chat-Session` require that header to hold a valid token from `/api/chat/login` — see below.
 
@@ -85,6 +97,27 @@ All routes marked `X-Edit-Key` require that header to match the `EDIT_PASSWORD` 
 3. `GET /page/<slug>` requires that token: missing, expired, or minted for a different slug all redirect to `https://oliverbar.net/` instead of serving the page. The token is deleted the moment it's checked, whether or not it was valid — so a reload of the same URL always bounces, same as the built-in pages.
 
 This mirrors the existing sessionStorage guard's actual security level (a casual "don't bookmark or reload into this" gate, not a defense against someone reading the client-side source) — see the Security model section below.
+
+### Guest passes: the multi-use variant
+
+Single-use tokens are the right shape for "the visitor already knows the trigger word." They're the wrong shape for "share this page with someone who doesn't." `POST /api/admin/guest-pass` (admin-only) mints a `guest_pass:<token> → {slug}` with a TTL you choose (1 minute to 24 hours) — checked, but **never deleted**, on every `GET /page/<slug>?g=<token>` until it expires on its own. That's the whole difference from the `?t=` flow: a guest pass is meant to be reused by whoever has the link, for as long as its window is open.
+
+## Trigger mechanics: aliases, one-time, scheduled, random
+
+Custom redirects (in `site_config.custom`) support a few optional fields beyond `trigger`/`destination`/`enabled`, all validated leniently (missing = old behavior, exactly as before these existed):
+
+- `aliases: string[]` — up to 5 extra trigger words that all lead to the same place.
+- `oneTime: boolean` — once matched, `index.html` calls `POST /api/config/disable-custom` with the redirect's id, which sets `enabled: false` server-side. No auth needed: reaching that call already required typing the trigger word, the same trust level as the usage-counter ping.
+- `activeFrom` / `activeUntil` — epoch-millisecond bounds; outside that window, the redirect is treated as if `enabled: false`. Checked client-side in `index.html`'s `checkTriggers()`.
+- `random: boolean` — ignores `destination` entirely; on match, the client calls `GET /api/pages/random` for a random Custom Page slug and navigates there through the normal token flow instead.
+
+## Backup, restore, and the raw KV inspector
+
+Three small admin-only tools, all in the Dashboard/Experimental tabs:
+
+- **Backup/restore** (`GET /api/admin/export`, `POST /api/admin/import`) round-trips `{config, pages}` — the trigger config and Custom Pages — as one JSON file. Deliberately excludes chat/DM data; this is a config backup, not a data export. Import re-applies the same admin-lockout backstop as a normal config save (admin's trigger/enabled can't come back wrong from a backup either).
+- **Raw KV inspector** (`GET /api/admin/kv`, `GET /api/admin/kv/value?key=`) reads directly from KV for debugging, but only keys on a hardcoded allowlist (`KV_INSPECTOR_ALLOWLIST` in `index.js`): `site_config`, `custom_pages`, `chat_messages`, `chat_pinned`, `trigger_stats`, `lifetime_stats`, `layout`. Everything DM-, session-, token-, or PIN-related is deliberately excluded — the point of the allowlist is that even the admin password can't turn into a way to read someone's private messages.
+- **Burn-after-reading notes** (`POST /api/notes/create`, `GET /secret/<id>`) are admin-created (not a public feature — otherwise this Worker would double as a free anonymous paste bin for anyone). Reading one deletes it immediately, so the link only ever works once, for whoever opens it first. Unread notes expire after 30 days regardless.
 
 ## Why the admin trigger can never be locked out
 
@@ -145,7 +178,9 @@ There's still **no admin password** involved in chatting — anyone who reaches 
 - The admin panel's Accounts tab lists every claimed name (`GET /api/chat/names`) and can free one up (`POST /api/chat/names/release`) if it needs to change hands. Anyone can also do this to themselves via `POST /api/chat/release-me`, and change their own PIN via `POST /api/chat/change-pin` without knowing the old one (the session itself is proof enough).
 - Each account also carries a self-service **avatar** (a short emoji, `GET`/`POST /api/chat/profile`) and **status line** (max 40 characters, same endpoint), both freely visible to anyone logged in — think of them as public, not secrets.
 - **Blocking** (`POST /api/chat/block` / `/unblock`, `GET /api/chat/blocks`) is per-account and enforced server-side for 1:1 conversations: if someone has blocked you, `/api/dm/start` and `/api/dm/send` both refuse outright. It isn't enforced for group conversations (3+ people) — a deliberate scope cut, documented as a limitation rather than silently half-working. Global chat isn't filtered server-side either; the block list is just exposed for the chat page to filter its own rendering.
-- **Typing indicators** (`POST`/`GET /api/typing`) and the **online-now badge** (`POST`/`GET /api/chat/presence`) both work the same way: a KV key per identity with a few seconds' TTL, refreshed by a client-side ping loop. Neither is meant to be precise — they're "as of the last few seconds," same spirit as the anonymous presence counter.
+- **Typing indicators** (`POST`/`GET /api/typing`) work via a KV key per identity with a few seconds' TTL, refreshed by a client-side ping loop — not meant to be precise, "as of the last few seconds."
+- **Presence** (`POST`/`GET /api/chat/presence`) now returns `{online, lastSeen}` per name instead of a bare boolean: `online` comes from the same short-TTL heartbeat as before, `lastSeen` comes from `last_seen:<lowerName>` (touched on login, posting, and every presence ping), which never expires — so the chat page can show "online" or "last seen 5m ago" once the heartbeat itself has lapsed.
+- Every account also tracks a lifetime **`messageCount`** (global + DM combined), returned from `/api/chat/profile` and the admin's `/api/chat/names` — the chat page derives simple achievement badges from it client-side (nothing server-enforced, just a threshold check).
 - **Edit and delete** (`POST /api/chat/edit` / `/api/chat/delete`) only work on your own messages (checked server-side against the session name, not just hidden client-side). Delete is a soft tombstone — the message stays in the array with `deleted: true` and `text: null` so the conversation doesn't jump around, and reactions are cleared.
 - **Reactions** (`POST /api/chat/react`) toggle: react again with the same emoji to remove it. Stored inline on the message as `reactions: { "👍": ["Alice", "Bob"] }`.
 - **Pinned messages** (`GET /api/chat/pinned`, `POST /api/chat/pin` / `/unpin`) are admin-only to set — gated by `X-Edit-Key`, same as everything else the admin password protects — but public to read, since the point is for every visitor to see them.
