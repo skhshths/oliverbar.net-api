@@ -390,6 +390,33 @@ async function handleRequest(request, env) {
       });
     }
 
+    // ---------- Pi terminal lockdown ----------
+    // Kill switch for the Pi terminal. Two very different things read this:
+    // the terminal page, which blanks its frame the moment the flag flips,
+    // and a poller on the Pi itself, which stops ttyd outright.
+    //
+    // The page alone would only lock the website. Anyone who bookmarked
+    // pi.oliverbar.net would sail straight past it, and a browser holding
+    // cached basic-auth credentials cannot be de-authed from here at all.
+    // The Pi-side poller is what actually severs live sessions.
+    //
+    // GET is deliberately unauthenticated: the poller on the Pi needs it and
+    // shouldn't be carrying the admin key around to get a single boolean.
+    if (url.pathname === "/api/pi/lockdown" && request.method === "GET") {
+      const state = await getJSON(env, "pi_lockdown", { locked: false, since: 0 });
+      return respond({ locked: !!state.locked, since: state.since || 0 });
+    }
+
+    if (url.pathname === "/api/pi/lockdown" && request.method === "POST") {
+      const denied = requireEditKey(request);
+      if (denied) return denied;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const state = { locked: !!body.data.locked, since: Date.now() };
+      await putJSON(env, "pi_lockdown", state);
+      return respond(state);
+    }
+
     // ---------- Chat login (claims a name on first use) ----------
     // The one place a name+PIN pair is ever checked. A successful login
     // mints a session token good for a week, which is what every other
