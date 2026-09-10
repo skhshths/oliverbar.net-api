@@ -390,6 +390,46 @@ async function handleRequest(request, env) {
       });
     }
 
+    // ---------- Maintenance mode ----------
+    // A site-wide flag. GET is unauthenticated because the public entry
+    // screen has to read it before deciding whether to let a trigger
+    // through. Enforcement lives in the entry page, which always exempts
+    // the admin trigger so this can never lock you out of the switch.
+    if (url.pathname === "/api/maintenance" && request.method === "GET") {
+      const m = await getJSON(env, "maintenance", { on: false, message: "", since: 0 });
+      return respond({ on: !!m.on, message: typeof m.message === "string" ? m.message : "", since: m.since || 0 });
+    }
+    if (url.pathname === "/api/maintenance" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const m = {
+        on: !!body.data.on,
+        message: typeof body.data.message === "string" ? body.data.message.slice(0, 500) : "",
+        since: Date.now(),
+      };
+      await putJSON(env, "maintenance", m);
+      return respond(m);
+    }
+
+    // ---------- Broadcast banner ----------
+    // A short message shown to everyone in chat. GET unauthenticated (the
+    // chat page reads it); POST admin-only. Empty text clears it.
+    if (url.pathname === "/api/broadcast" && request.method === "GET") {
+      const b = await getJSON(env, "broadcast", { text: "", since: 0 });
+      return respond({ text: typeof b.text === "string" ? b.text : "", since: b.since || 0 });
+    }
+    if (url.pathname === "/api/broadcast" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const b = { text: typeof body.data.text === "string" ? body.data.text.slice(0, 300) : "", since: Date.now() };
+      await putJSON(env, "broadcast", b);
+      return respond(b);
+    }
+
     // ---------- Pi terminal lockdown ----------
     // Kill switch for the Pi terminal. Two very different things read this:
     // the terminal page, which blanks its frame the moment the flag flips,
