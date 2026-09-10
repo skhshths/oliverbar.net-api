@@ -286,7 +286,19 @@ async function handleRequest(request, env) {
     // ---------- Site config: fixed pages + custom redirects ----------
     if (url.pathname === "/api/config" && request.method === "GET") {
       const stored = await env.LAYOUT_KV.get("site_config");
-      return new Response(stored || JSON.stringify(DEFAULT_CONFIG), {
+      // A stored config only holds the pages that existed the last time
+      // someone hit Save. Layer it over the defaults so a newly added
+      // built-in page still appears — otherwise its trigger silently does
+      // nothing until somebody happens to save the admin panel again.
+      let config = DEFAULT_CONFIG;
+      if (stored) {
+        try {
+          config = { ...DEFAULT_CONFIG, ...JSON.parse(stored) };
+        } catch (e) {
+          config = DEFAULT_CONFIG; // corrupt value shouldn't take the site down
+        }
+      }
+      return new Response(JSON.stringify(config), {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
     }
