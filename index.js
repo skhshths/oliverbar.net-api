@@ -28,8 +28,7 @@ const PBKDF2_ITERATIONS = 100000;
 
 const PAGE_TOKEN_TTL_SECONDS = 60; // how long a minted /page/ access token stays valid if unused
 const PRESENCE_TTL_SECONDS = 30; // an anonymous site-wide presence ping counts as "here" for this long
-const CHAT_PRESENCE_TTL_SECONDS = 30; // same idea, but tied to a logged-in name for the "online now" badge
-const TYPING_TTL_SECONDS = 5; // how long a "still typing" flag lasts without a fresh ping
+const ONLINE_WINDOW_MS = 90 * 1000; // seen this recently == "online now"
 const CHAT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // how long a chat login stays valid
 const SECRET_NOTE_TTL_SECONDS = 30 * 24 * 60 * 60; // an unread burn-after-reading note expires after 30 days
 const MAX_SECRET_NOTE_LENGTH = 2000;
@@ -171,31 +170,42 @@ async function saveNames(env, names) {
   await putJSON(env, "chat_names", names);
 }
 
-// Touched on login, posting, and presence pings — this is what backs
-// "last seen 5m ago" once someone's chat_presence key has expired.
-// Unlike chat_presence, this key never expires on its own.
+// Set on login and on every presence ping. Doubles as the "online now"
+// signal — see the /api/chat/presence routes.
 async function touchLastSeen(env, name) {
   await env.LAYOUT_KV.put("last_seen:" + name.toLowerCase(), String(Date.now()));
 }
 
-async function bumpMessageCount(env, name) {
-  const names = await loadNames(env);
-  const rec = names[name.toLowerCase()];
-  if (rec) {
-    rec.messageCount = (rec.messageCount || 0) + 1;
-    await saveNames(env, names);
-  }
-}
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, X-Edit-Key, X-Chat-Session",
+};
 
 export default {
   async fetch(request, env) {
+    // Without this, an exception anywhere below (a blown KV quota is the
+    // usual cause) escapes to Cloudflare's own error page, which carries
+    // no CORS headers — so the browser reports the useless "Failed to
+    // fetch" instead of what actually went wrong. Catching here means
+    // real errors come back as readable JSON.
+    try {
+      return await handleRequest(request, env);
+    } catch (err) {
+      const detail = err && err.message ? err.message : String(err);
+      return new Response(JSON.stringify({ error: "Worker error: " + detail }), {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+      });
+    }
+  },
+};
+
+async function handleRequest(request, env) {
+  {
     const url = new URL(request.url);
 
-    const corsHeaders = {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, X-Edit-Key, X-Chat-Session",
-    };
+    const corsHeaders = CORS_HEADERS;
 
     // Shorthand for the newer routes below — captures corsHeaders so
     // each route body doesn't have to repeat the same response shape.
@@ -411,7 +421,7 @@ export default {
       const result = {};
       requested.forEach(function (n) {
         const rec = names[n.toLowerCase()];
-        result[n] = rec ? { name: rec.name, avatar: rec.avatar || "", status: rec.status || "", messageCount: rec.messageCount || 0 } : null;
+        result[n] = rec ? { name: rec.name, avatar: rec.avatar || "", status: rec.status || "" } : null;
       });
       return respond(result);
     }
@@ -520,36 +530,11 @@ export default {
       return respond(rec && rec.blocked ? rec.blocked : []);
     }
 
-    // ---------- Typing indicators ----------
-    if (url.pathname === "/api/typing" && request.method === "POST") {
-      const name = await getSessionName(request, env);
-      const guard = requireSession(name);
-      if (guard) return guard;
-      const body = await readBody(request);
-      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
-      const scope = body.data.scope === "dm" ? "dm" : "global";
-      const convId = typeof body.data.convId === "string" ? body.data.convId : "";
-      if (scope === "dm" && !convId) return respond({ error: "convId is required for dm scope" }, 400);
-      const key = scope === "global"
-        ? "typing:global:" + name.toLowerCase()
-        : "typing:dm:" + convId + ":" + name.toLowerCase();
-      await env.LAYOUT_KV.put(key, name, { expirationTtl: TYPING_TTL_SECONDS });
-      return respond({ ok: true });
-    }
-
-    if (url.pathname === "/api/typing" && request.method === "GET") {
-      const name = await getSessionName(request, env);
-      const guard = requireSession(name);
-      if (guard) return guard;
-      const scope = url.searchParams.get("scope") === "dm" ? "dm" : "global";
-      const convId = url.searchParams.get("convId") || "";
-      if (scope === "dm" && !convId) return respond({ error: "convId is required for dm scope" }, 400);
-      const prefix = scope === "global" ? "typing:global:" : "typing:dm:" + convId + ":";
-      const listed = await env.LAYOUT_KV.list({ prefix: prefix, limit: 50 });
-      const values = await Promise.all(listed.keys.map(function (k) { return env.LAYOUT_KV.get(k.name); }));
-      const typers = values.filter(function (v) { return v && v.toLowerCase() !== name.toLowerCase(); });
-      return respond(typers);
-    }
+    // Typing indicators used to live here. They were removed on purpose:
+    // the GET ran a KV list() every 2 seconds per viewer against a free
+    // tier that allows 1,000 list operations *per day*, so a single open
+    // tab drained the quota in about half an hour and every write after
+    // that failed. Not worth it for a "…is typing" line.
 
     // ---------- Chat presence ("online now" badge on a name) ----------
     // Separate from the anonymous /api/presence/* pair below, which
@@ -558,15 +543,18 @@ export default {
       const name = await getSessionName(request, env);
       const guard = requireSession(name);
       if (guard) return guard;
-      await env.LAYOUT_KV.put("chat_presence:" + name.toLowerCase(), "1", { expirationTtl: CHAT_PRESENCE_TTL_SECONDS });
-      await touchLastSeen(env, name);
+      // One key, one write. It used to be two (a TTL'd "presence" flag
+      // plus a separate last_seen timestamp), but a timestamp already
+      // answers both questions: "online" is just "seen in the last
+      // minute". Halving this mattered — it's the most frequent write
+      // on the site.
+      await env.LAYOUT_KV.put("last_seen:" + name.toLowerCase(), String(Date.now()));
       return respond({ ok: true });
     }
 
-    // Returns both an "online now" flag and a lastSeen timestamp per
-    // requested name — the flag comes from the short-TTL chat_presence
-    // key, the timestamp from last_seen (which never expires), so the
-    // chat page can show "online" or "last seen 5m ago" as appropriate.
+    // Derives "online now" from the same timestamp rather than a second
+    // key: recent enough counts as online, anything older reports how
+    // long ago it was.
     if (url.pathname === "/api/chat/presence" && request.method === "GET") {
       const requester = await getSessionName(request, env);
       const guard = requireSession(requester);
@@ -575,12 +563,9 @@ export default {
       const requested = namesParam.split(",").map(function (n) { return n.trim(); }).filter(Boolean);
       const result = {};
       await Promise.all(requested.map(async function (n) {
-        const key = n.toLowerCase();
-        const [online, lastSeen] = await Promise.all([
-          env.LAYOUT_KV.get("chat_presence:" + key),
-          env.LAYOUT_KV.get("last_seen:" + key),
-        ]);
-        result[n] = { online: !!online, lastSeen: lastSeen ? Number(lastSeen) : null };
+        const raw = await env.LAYOUT_KV.get("last_seen:" + n.toLowerCase());
+        const ts = raw ? Number(raw) : null;
+        result[n] = { online: !!ts && (Date.now() - ts) < ONLINE_WINDOW_MS, lastSeen: ts };
       }));
       return respond(result);
     }
@@ -619,8 +604,6 @@ export default {
       const trimmed = messages.length > MAX_CHAT_MESSAGES ? messages.slice(messages.length - MAX_CHAT_MESSAGES) : messages;
       await putJSON(env, "chat_messages", trimmed);
       await bumpLifetimeStat(env, "totalGlobalMessages");
-      await bumpMessageCount(env, name);
-      await touchLastSeen(env, name);
       return respond({ ok: true, name: name, id: message.id });
     }
 
@@ -816,8 +799,6 @@ export default {
       const trimmed = messages.length > MAX_DM_MESSAGES ? messages.slice(messages.length - MAX_DM_MESSAGES) : messages;
       await putJSON(env, "dm_messages:" + convId, trimmed);
       await bumpLifetimeStat(env, "totalDmMessages");
-      await bumpMessageCount(env, fromName);
-      await touchLastSeen(env, fromName);
 
       await Promise.all(conversation.participants.map(function (p) { return upsertThread(env, p, conversation, message); }));
 
@@ -833,7 +814,79 @@ export default {
       if (guard) return guard;
       const threads = await getJSON(env, "dm_threads:" + name.toLowerCase(), []);
       threads.sort(function (a, b) { return b.lastTs - a.lastTs; });
+      // Flag which ones this person has locked, so the inbox can show a
+      // padlock without leaking anything about the PIN itself.
+      await Promise.all(threads.map(async function (t) {
+        const lock = await env.LAYOUT_KV.get("dm_lock:" + t.convId + ":" + name.toLowerCase());
+        t.locked = !!lock;
+      }));
       return respond(threads);
+    }
+
+    // ---------- Per-person conversation locks ----------
+    // A lock is personal: each participant sets (or doesn't set) their
+    // own PIN on a conversation, and it only gates their own view of it.
+    // Nobody can lock anyone else out, and neither side ever needs to
+    // know the other's PIN.
+    if (url.pathname === "/api/dm/lock" && request.method === "POST") {
+      const name = await getSessionName(request, env);
+      const guard = requireSession(name);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const convId = typeof body.data.convId === "string" ? body.data.convId : "";
+      const pin = typeof body.data.pin === "string" ? body.data.pin : "";
+      if (!convId) return respond({ error: "convId is required" }, 400);
+      if (pin.length < MIN_PIN_LENGTH || pin.length > MAX_PIN_LENGTH) {
+        return respond({ error: "PIN must be " + MIN_PIN_LENGTH + "-" + MAX_PIN_LENGTH + " characters" }, 400);
+      }
+      const conversation = await getJSON(env, "dm_conversations:" + convId, null);
+      if (!conversation || conversation.participants.map(function (p) { return p.toLowerCase(); }).indexOf(name.toLowerCase()) === -1) {
+        return respond({ error: "Conversation not found" }, 404);
+      }
+      const saltHex = randomHex(16);
+      const hashHex = await hashPin(pin, saltHex);
+      await putJSON(env, "dm_lock:" + convId + ":" + name.toLowerCase(), { saltHex: saltHex, hashHex: hashHex });
+      return respond({ ok: true });
+    }
+
+    // Checks a PIN against your own lock. Nothing is stored server-side
+    // once it passes — the client holds "unlocked" for the tab session,
+    // so closing the tab re-locks it.
+    if (url.pathname === "/api/dm/unlock" && request.method === "POST") {
+      const name = await getSessionName(request, env);
+      const guard = requireSession(name);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const convId = typeof body.data.convId === "string" ? body.data.convId : "";
+      const pin = typeof body.data.pin === "string" ? body.data.pin : "";
+      if (!convId) return respond({ error: "convId is required" }, 400);
+      const lock = await getJSON(env, "dm_lock:" + convId + ":" + name.toLowerCase(), null);
+      if (!lock) return respond({ ok: true, locked: false });
+      const candidate = await hashPin(pin, lock.saltHex);
+      if (candidate !== lock.hashHex) return respond({ error: "Wrong PIN for this conversation." }, 401);
+      return respond({ ok: true, locked: true });
+    }
+
+    // Taking a lock off needs the PIN too, so someone on a tab you left
+    // open can't just strip it.
+    if (url.pathname === "/api/dm/lock/remove" && request.method === "POST") {
+      const name = await getSessionName(request, env);
+      const guard = requireSession(name);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const convId = typeof body.data.convId === "string" ? body.data.convId : "";
+      const pin = typeof body.data.pin === "string" ? body.data.pin : "";
+      if (!convId) return respond({ error: "convId is required" }, 400);
+      const key = "dm_lock:" + convId + ":" + name.toLowerCase();
+      const lock = await getJSON(env, key, null);
+      if (!lock) return respond({ ok: true });
+      const candidate = await hashPin(pin, lock.saltHex);
+      if (candidate !== lock.hashHex) return respond({ error: "Wrong PIN for this conversation." }, 401);
+      await env.LAYOUT_KV.delete(key);
+      return respond({ ok: true });
     }
 
     // Removes a conversation from the caller's own inbox only — it
@@ -983,7 +1036,6 @@ export default {
         return {
           name: names[key].name, createdAt: names[key].createdAt,
           avatar: names[key].avatar || "", status: names[key].status || "",
-          messageCount: names[key].messageCount || 0,
         };
       }).sort(function (a, b) { return a.createdAt - b.createdAt; });
 
@@ -1222,6 +1274,30 @@ export default {
       return new Response(JSON.stringify({ ok: true }), {
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
+    }
+
+    // Upserts ONE page instead of replacing the whole array. The bulk
+    // POST above sends every page in a single body, which stops working
+    // once you have a few big ones — a request carrying ~40KB of game
+    // HTML gets refused upstream before it ever reaches this Worker.
+    // Saving one at a time keeps each request small.
+    if (url.pathname === "/api/pages/one" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const page = body.data;
+      const SLUG_RE = /^[a-z0-9-]+(?:\/[a-z0-9-]+)*$/;
+      if (!(page && typeof page.slug === "string" && SLUG_RE.test(page.slug) &&
+            typeof page.html === "string" && page.html.length > 0)) {
+        return respond({ error: "Needs a valid lowercase slug and non-empty html" }, 400);
+      }
+      const pages = await getJSON(env, "custom_pages", []);
+      const at = pages.findIndex(function (p) { return p.slug === page.slug; });
+      if (at === -1) pages.push({ slug: page.slug, html: page.html });
+      else pages[at] = { slug: page.slug, html: page.html };
+      await putJSON(env, "custom_pages", pages);
+      return respond({ ok: true, slug: page.slug, total: pages.length });
     }
 
     // Mints a short-lived, single-use token needed to view a custom page
@@ -1479,5 +1555,5 @@ export default {
     }
 
     return new Response("Not found", { status: 404, headers: corsHeaders });
-  },
-};
+  }
+}
