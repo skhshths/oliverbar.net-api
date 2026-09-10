@@ -1,4 +1,7 @@
+import { BUILT_IN_GAMES } from "./games.js";
+
 const ADMIN_TRIGGER_FIXED = "ADMIN"; // permanently fixed, cannot be changed via the admin UI or the API
+const CONTENT_BASE = "https://pages.oliverbar.net"; // where built-in game URLs point
 const ROOT_SITE = "https://oliverbar.net/"; // where /page/<slug> bounces to when there's no valid access token
 
 const DEFAULT_CONFIG = {
@@ -1185,7 +1188,36 @@ async function handleRequest(request, env) {
     // needs it); writing is admin-only, same as every other config.
     if (url.pathname === "/api/games" && request.method === "GET") {
       const games = await getJSON(env, "games", []);
+      // Nothing configured yet? Hand back the bundled games so the hub
+      // works out of the box. As soon as the admin panel saves a list,
+      // that list wins — including if it drops some of these.
+      if (!games.length) {
+        return respond(Object.keys(BUILT_IN_GAMES).map(function (slug) {
+          return {
+            id: "builtin_" + slug,
+            title: BUILT_IN_GAMES[slug].title,
+            url: CONTENT_BASE + "/game/" + slug,
+            enabled: true,
+          };
+        }));
+      }
       return respond(games);
+    }
+
+    // Serves a bundled game. Unlike /page/<slug> these need no access
+    // token: they ship with the Worker, contain nothing private, and
+    // the hub frames them directly.
+    if (url.pathname.startsWith("/game/") && request.method === "GET") {
+      const slug = url.pathname.slice("/game/".length);
+      const game = BUILT_IN_GAMES[slug];
+      if (!game) return new Response("Not found", { status: 404, headers: corsHeaders });
+      return new Response(game.html, {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Cache-Control": "public, max-age=3600",
+          ...corsHeaders,
+        },
+      });
     }
 
     if (url.pathname === "/api/games" && request.method === "POST") {
