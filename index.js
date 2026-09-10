@@ -135,7 +135,17 @@ async function getSessionName(request, env) {
 // casing — used to find an existing conversation instead of creating a
 // duplicate every time the same group messages each other.
 function participantSetKey(names) {
+  if (!Array.isArray(names)) return "";
   return names.map(function (n) { return n.toLowerCase(); }).sort().join(",");
+}
+
+// Inbox entries written before DMs became multi-participant conversations
+// look like {partner, lastTs, ...} — no convId, no participants array.
+// There's no way to map those onto a conversation (the id never existed),
+// so they get dropped rather than crashing every route that walks the
+// inbox.
+function isUsableThread(t) {
+  return !!(t && typeof t.convId === "string" && t.convId && Array.isArray(t.participants));
 }
 
 // Updates `ownerName`'s DM inbox with a fresh preview of `conversation`.
@@ -755,7 +765,7 @@ async function handleRequest(request, env) {
         }
       }
 
-      const myThreads = await getJSON(env, "dm_threads:" + fromName.toLowerCase(), []);
+      const myThreads = (await getJSON(env, "dm_threads:" + fromName.toLowerCase(), [])).filter(isUsableThread);
       const existing = myThreads.find(function (t) { return participantSetKey(t.participants) === setKey; });
       if (existing) return respond({ convId: existing.convId, participants: existing.participants });
 
@@ -815,7 +825,14 @@ async function handleRequest(request, env) {
       const name = await getSessionName(request, env);
       const guard = requireSession(name);
       if (guard) return guard;
-      const threads = await getJSON(env, "dm_threads:" + name.toLowerCase(), []);
+      const stored = await getJSON(env, "dm_threads:" + name.toLowerCase(), []);
+      const threads = stored.filter(isUsableThread);
+      // Self-heal: if anything unusable was in there, write the cleaned
+      // list back once so it stops being a problem. Only on an actual
+      // change — this route is polled, and writes are the scarce quota.
+      if (threads.length !== stored.length) {
+        await putJSON(env, "dm_threads:" + name.toLowerCase(), threads);
+      }
       threads.sort(function (a, b) { return b.lastTs - a.lastTs; });
       // Flag which ones this person has locked, so the inbox can show a
       // padlock without leaking anything about the PIN itself.
