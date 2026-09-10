@@ -10,6 +10,7 @@ const DEFAULT_CONFIG = {
   portfolio:   { label: "Portfolio",   trigger: "portfolio",         enabled: true },
   chat:        { label: "Chat",        trigger: "chat",              enabled: true },
   games:       { label: "Games",       trigger: "game123",           enabled: true },
+  pi:          { label: "Pi Terminal", trigger: "pi5",               enabled: true },
   custom: [],
 };
 
