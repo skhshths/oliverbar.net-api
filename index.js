@@ -1389,6 +1389,22 @@ async function handleRequest(request, env) {
       return respond({ ok: true, slug: page.slug, total: pages.length });
     }
 
+    // Deletes ONE page by slug. Needed because /api/pages/one only upserts —
+    // the old bulk POST removed a page by omitting it from the array, so the
+    // per-page save path needs an explicit delete to match that behaviour.
+    if (url.pathname === "/api/pages/delete" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const slug = typeof body.data.slug === "string" ? body.data.slug : "";
+      if (!slug) return respond({ error: "slug is required" }, 400);
+      const pages = await getJSON(env, "custom_pages", []);
+      const next = pages.filter(function (p) { return p.slug !== slug; });
+      if (next.length !== pages.length) await putJSON(env, "custom_pages", next);
+      return respond({ ok: true, slug: slug, total: next.length });
+    }
+
     // Mints a short-lived, single-use token needed to view a custom page
     // at /page/<slug>. Without one, that URL just bounces to the home
     // page — see the /page/ route below. This is what makes those pages
