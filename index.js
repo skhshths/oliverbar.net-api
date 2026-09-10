@@ -31,8 +31,8 @@ const MAX_GROUP_PARTICIPANTS = 12;
 const PBKDF2_ITERATIONS = 100000;
 
 const PAGE_TOKEN_TTL_SECONDS = 60; // how long a minted /page/ access token stays valid if unused
-const PRESENCE_TTL_SECONDS = 30; // an anonymous site-wide presence ping counts as "here" for this long
-const ONLINE_WINDOW_MS = 90 * 1000; // seen this recently == "online now"
+const PRESENCE_TTL_SECONDS = 75; // an anonymous site-wide presence ping counts as "here" for this long (kept above the entry page's 60s ping so the count doesn't drop out between pings)
+const ONLINE_WINDOW_MS = 300 * 1000; // seen this recently == "online now"; must exceed the chat page's PRESENCE_PING_MS (180s) with margin so a live user never flickers offline
 const CHAT_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60; // how long a chat login stays valid
 const SECRET_NOTE_TTL_SECONDS = 30 * 24 * 60 * 60; // an unread burn-after-reading note expires after 30 days
 const MAX_SECRET_NOTE_LENGTH = 2000;
