@@ -11,6 +11,7 @@ const DEFAULT_CONFIG = {
   chat:        { label: "Chat",        trigger: "chat",              enabled: true },
   games:       { label: "Games",       trigger: "game123",           enabled: true },
   pi:          { label: "Pi Terminal", trigger: "pi5",               enabled: true },
+  capsule:     { label: "Time Capsule", trigger: "capsule",          enabled: true },
   custom: [],
 };
 
@@ -428,6 +429,62 @@ async function handleRequest(request, env) {
       const b = { text: typeof body.data.text === "string" ? body.data.text.slice(0, 300) : "", since: Date.now() };
       await putJSON(env, "broadcast", b);
       return respond(b);
+    }
+
+    // ---------- Time capsules ----------
+    // A capsule is a message sealed until a chosen date. The server never
+    // returns a sealed capsule's text — that rule is enforced HERE, not just
+    // in the UI, so you can't peek early by hitting the API directly.
+    if (url.pathname === "/api/capsules" && request.method === "GET") {
+      const now = Date.now();
+      const all = await getJSON(env, "time_capsules", []);
+      const out = all.map(function (c) {
+        const unlocked = now >= c.unlockAt;
+        return {
+          id: c.id,
+          title: typeof c.title === "string" ? c.title : "",
+          from: typeof c.from === "string" ? c.from : "",
+          createdAt: c.createdAt || 0,
+          unlockAt: c.unlockAt || 0,
+          unlocked: unlocked,
+          message: unlocked ? c.message : "", // sealed content never leaves the server
+        };
+      }).sort(function (a, b) { return a.unlockAt - b.unlockAt; });
+      return respond(out);
+    }
+    if (url.pathname === "/api/capsules" && request.method === "POST") {
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const message = typeof body.data.message === "string" ? body.data.message.trim() : "";
+      const title = typeof body.data.title === "string" ? body.data.title.trim().slice(0, 80) : "";
+      const from = typeof body.data.from === "string" ? body.data.from.trim().slice(0, 40) : "";
+      const unlockAt = Number(body.data.unlockAt);
+      if (!message) return respond({ error: "A message is required" }, 400);
+      if (message.length > 2000) return respond({ error: "Message is too long (2000 chars max)" }, 400);
+      if (!unlockAt || !isFinite(unlockAt) || unlockAt <= Date.now()) {
+        return respond({ error: "The unlock date must be in the future" }, 400);
+      }
+      if (unlockAt > Date.now() + 50 * 365 * 24 * 3600 * 1000) {
+        return respond({ error: "The unlock date is too far away (50 years max)" }, 400);
+      }
+      const all = await getJSON(env, "time_capsules", []);
+      if (all.length >= 200) return respond({ error: "The capsule wall is full" }, 400);
+      const capsule = { id: randomHex(8), title: title, from: from, message: message, createdAt: Date.now(), unlockAt: unlockAt };
+      all.push(capsule);
+      await putJSON(env, "time_capsules", all);
+      return respond({ ok: true, id: capsule.id, unlockAt: unlockAt });
+    }
+    if (url.pathname === "/api/capsules/delete" && request.method === "POST") {
+      const guard = requireEditKey(request);
+      if (guard) return guard;
+      const body = await readBody(request);
+      if (!body.ok) return respond({ error: "Invalid JSON" }, 400);
+      const id = typeof body.data.id === "string" ? body.data.id : "";
+      if (!id) return respond({ error: "id is required" }, 400);
+      const all = await getJSON(env, "time_capsules", []);
+      const next = all.filter(function (c) { return c.id !== id; });
+      if (next.length !== all.length) await putJSON(env, "time_capsules", next);
+      return respond({ ok: true, total: next.length });
     }
 
     // ---------- Pi terminal lockdown ----------
