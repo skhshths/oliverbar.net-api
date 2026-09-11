@@ -12,6 +12,7 @@ const DEFAULT_CONFIG = {
   games:       { label: "Games",       trigger: "game123",           enabled: true },
   pi:          { label: "Pi Terminal", trigger: "pi5",               enabled: true },
   capsule:     { label: "Time Capsule", trigger: "capsule",          enabled: true },
+  console:     { label: "Linux Console", trigger: "console",          enabled: true },
   custom: [],
 };
 
